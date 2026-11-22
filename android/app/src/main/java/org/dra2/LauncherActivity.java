@@ -8,6 +8,12 @@ import android.os.Bundle;
 import android.view.Gravity;
 import android.widget.Button;
 import android.widget.LinearLayout;
+import android.widget.ScrollView;
+import android.content.ClipData;
+import android.content.ClipboardManager;
+import android.content.Context;
+import java.io.File;
+import java.io.RandomAccessFile;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -16,8 +22,15 @@ public class LauncherActivity extends Activity {
     private static final int REQ_PICK = 1;
     private SharedPreferences prefs;
 
-    @Override protected void onCreate(Bundle b) {
-        super.onCreate(b);
+    @Override protected void onResume() { super.onResume(); build(); }
+
+    private String readLog() {
+        try (RandomAccessFile f = new RandomAccessFile(new File(getFilesDir(), "last.log"), "r")) {
+            long n = Math.min(f.length(), 4000); byte[] buf = new byte[(int) n]; f.seek(f.length() - n); f.readFully(buf); return new String(buf);
+        } catch (Exception e) { return null; }
+    }
+
+    private void build() {
         prefs = getSharedPreferences("dra2", MODE_PRIVATE);
         LinearLayout l = new LinearLayout(this);
         l.setOrientation(LinearLayout.VERTICAL); l.setGravity(Gravity.CENTER); l.setPadding(48, 48, 48, 48);
@@ -27,13 +40,21 @@ public class LauncherActivity extends Activity {
         Button pick = new Button(this); pick.setText("Choose disc image");
         pick.setOnClickListener(v -> pick());
         l.addView(t); l.addView(pick);
+        final String log = readLog();
         String saved = prefs.getString("disc", null);
         if (saved != null) {
             Button play = new Button(this); play.setText("Play (last disc)");
             play.setOnClickListener(v -> start(Uri.parse(saved)));
             l.addView(play);
         }
-        setContentView(l);
+        if (log != null) {
+            TextView lt = new TextView(this); lt.setTextSize(10); lt.setTypeface(android.graphics.Typeface.MONOSPACE); lt.setText("Log of the last run:\n" + log);
+            Button copy = new Button(this); copy.setText("Copy log");
+            copy.setOnClickListener(v -> { ((ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE)).setPrimaryClip(ClipData.newPlainText("log", log)); Toast.makeText(this, "Copied", Toast.LENGTH_SHORT).show(); });
+            l.addView(copy); l.addView(lt);
+        }
+        ScrollView sv = new ScrollView(this); sv.addView(l);
+        setContentView(sv);
     }
 
     private void pick() {

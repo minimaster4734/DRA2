@@ -14,7 +14,7 @@ public class GameActivity extends SDLActivity {
         Uri u = getIntent().getData();
         try {
             disc = getContentResolver().openFileDescriptor(u, "r");
-            return new String[] { "/proc/self/fd/" + disc.getFd(), "100000" };
+            return new String[] { "/proc/self/fd/" + disc.getFd() };
         } catch (Exception e) {
             return new String[] { "/nonexistent.iso" };
         }

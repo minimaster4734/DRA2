@@ -1,3 +1,7 @@
+#include <csignal>
+#include <cerrno>
+#include <cstring>
+#include <unistd.h>
 #include "jit_rt.h"
 #include <algorithm>
 #include "gc.h"
@@ -36,6 +40,11 @@ JitBackend* (*g_backendFactory)() = nullptr;
 void flushMemCard();
 int main(int argc, char** argv) {
 #ifdef __ANDROID__
+  { const char* ip = SDL_AndroidGetInternalStoragePath();
+    if (ip) { static std::string lp = std::string(ip) + "/last.log"; if (!freopen(lp.c_str(), "w", stderr)) {} setvbuf(stderr, nullptr, _IONBF, 0);
+      static auto crash = [](int sig, siginfo_t* si, void*) { fprintf(stderr, "\nCRASH: signal %d at address %p\n", sig, si ? si->si_addr : nullptr); _exit(128 + sig); };
+      struct sigaction sa; memset(&sa, 0, sizeof sa); sa.sa_sigaction = crash; sa.sa_flags = SA_SIGINFO; for (int s : {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT}) sigaction(s, &sa, nullptr);
+      fprintf(stderr, "DRA2 start, %d args:", argc); for (int i = 0; i < argc; i++) fprintf(stderr, " %s", argv[i]); fputc(10, stderr); } }
   { const char* ip = SDL_AndroidGetInternalStoragePath(); if (ip && !getenv("DRA2_CARD")) { static std::string cp = std::string(ip) + "/card_a.raw"; setenv("DRA2_CARD", cp.c_str(), 1); } }
 #endif
   if (argc < 2) { fprintf(stderr, "usage: %s game.iso [max_million_instr] [-t]\n", argv[0]); return 1; }
@@ -43,8 +52,8 @@ int main(int argc, char** argv) {
   m->bus.m = m; m->cpu.m = m; m->cpu.bus = &m->bus;
   for (int i = 3; i < argc; i++) if (!strcmp(argv[i], "-t")) m->trace = true;
   if (!getenv("NOJIT")) { JitBackend* be = g_backendFactory ? g_backendFactory() : makeNativeBackend(); if (be && !getenv("INTERP")) { g_jit = new JitRT(); g_jit->be = be; fprintf(stderr, "JIT enabled\n"); } }
-  if (!m->loadIso(argv[1]) || !m->boot()) return 2;
-  if (!getenv("NOGFX")) { m->rd = new Renderer(); if (!m->rd->init(m, !getenv("HIDDEN"))) { fprintf(stderr, "renderer init failed\n"); m->rd = nullptr; } }
+  if (!m->loadIso(argv[1]) || !m->boot()) { fprintf(stderr, "load/boot failed (errno %d: %s)\n", errno, strerror(errno)); return 2; }
+  if (!getenv("NOGFX")) { m->rd = new Renderer(); if (!m->rd->init(m, !getenv("HIDDEN"))) { fprintf(stderr, "renderer init failed: %s\n", SDL_GetError()); m->rd = nullptr; } }
   bool rt = !getenv("NORT") && !getenv("HIDDEN") && !getenv("NOGFX"); if (!getenv("NOAUDIO")) audioInit();
   u64 maxI = (argc > 2 && argv[2][0] != 0x2d ? strtoull(argv[2], 0, 10) : 100000000ull) * 1000000ull;
   u64 nextRep = 0;
