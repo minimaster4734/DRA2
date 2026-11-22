@@ -57,6 +57,16 @@ built or run on a device yet (no Android SDK/NDK was available in the developmen
 while CPU emulation is unaffected. It stays off for 2 seconds whenever the game copies the EFB to a texture (skipping would leave
 those textures stale). The Android launcher has a Frameskip button (default Auto: engages when frames take longer than 24 ms).
 
+## Output filters
+`-filter 0..4` (or `FILTER=`; F2 cycles on desktop): 0 off (bilinear), 1 scanlines, 2 sharp-bilinear, 3 Scale2x (EPX, rendered once at 2x
+internal size and then scaled smoothly), 4 Scale2x + scanlines. Filters run only in the final present pass and need `highp` float in
+fragment shaders (GPUs without it, e.g. Mali-400, fall back to plain bilinear). Scanlines look best when the screen is at least ~2x the
+game's 528 lines.
+
+## Internal resolution
+`-scale 0.5..1.0` (or `RENDERSCALE=`; launcher: 100% / 75% / 50%) renders the EFB at a fraction of the native 640x528 and stretches it
+in the final pass. Texture copies and scissor rectangles are scaled accordingly. It reduces fill-rate and bandwidth, not CPU work.
+
 ## Saves (memory card)
 Slot A is emulated as a 16 Mbit (251-block) card backed by a raw image: `dra2_card_a.raw` in the working directory on
 Linux (override with `DRA2_CARD=/path`, disable with `NOCARD=1`), `card_a.raw` in the app's private storage on Android.

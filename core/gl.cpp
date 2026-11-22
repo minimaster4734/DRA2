@@ -22,6 +22,7 @@ struct Renderer::Impl {
   SDL_Window* win = nullptr; SDL_GLContext ctx = nullptr;
   GLuint fbo = 0, fboTex = 0, fboDepth = 0, vbo = 0;
   GLuint presentProg = 0, copyProg = 0, copyFbo = 0;
+  GLuint epxProg = 0, epxTex = 0, epxFbo = 0; bool highp = false; int fboW = EFB_W, fboH = EFB_H; float sc = 1.f;
   std::unordered_map<std::string, Prog> progs;
   std::unordered_map<u64, TexEntry> texCache;
   std::unordered_map<u32, TexEntry> efbTex;     // by destination address
@@ -69,11 +70,12 @@ bool Renderer::init(Machine* mach, bool showWindow) {
   fprintf(stderr, "GL: %s | %s\n", glGetString(GL_RENDERER), glGetString(GL_VERSION));
 
   glGenTextures(1, &d->fboTex); glBindTexture(GL_TEXTURE_2D, d->fboTex);
-  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, EFB_W, EFB_H, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+  { float s = std::min(1.0f, std::max(0.25f, renderScale)); d->sc = s; d->fboW = std::max(64, (int)(EFB_W * s + 0.5f)); d->fboH = std::max(64, (int)(EFB_H * s + 0.5f)); if (s != 1.0f) fprintf(stderr, "internal resolution %dx%d (%.0f%%)\n", d->fboW, d->fboH, s * 100); }
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, d->fboW, d->fboH, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
   glGenRenderbuffers(1, &d->fboDepth); glBindRenderbuffer(GL_RENDERBUFFER, d->fboDepth);
-  glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT16, EFB_W, EFB_H);
+  glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT16, d->fboW, d->fboH);
   glGenFramebuffers(1, &d->fbo); glBindFramebuffer(GL_FRAMEBUFFER, d->fbo);
   glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, d->fboTex, 0);
   glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, d->fboDepth);
@@ -82,8 +84,37 @@ bool Renderer::init(Machine* mach, bool showWindow) {
   glGenFramebuffers(1, &d->copyFbo);
 
   const char* pvs = "attribute vec2 a_pos; varying vec2 v_uv; void main(){ v_uv = a_pos*0.5+0.5; gl_Position = vec4(a_pos,0.0,1.0); }";
-  const char* pfs = "precision mediump float; varying vec2 v_uv; uniform sampler2D s0; void main(){ gl_FragColor = vec4(texture2D(s0, v_uv).rgb, 1.0); }";
-  d->presentProg = link(pvs, pfs);
+  { GLint rg[2] = {0, 0}, pr = 0; glGetShaderPrecisionFormat(GL_FRAGMENT_SHADER, GL_HIGH_FLOAT, rg, &pr); d->highp = pr != 0; }
+  const char* hdr = "#ifdef GL_FRAGMENT_PRECISION_HIGH\nprecision highp float;\n#else\nprecision mediump float;\n#endif\n";
+  // present pass: bilinear, optional sharp-bilinear (crisp texels, smooth edges) and optional scanlines on the source line grid
+  std::string pfs = std::string(hdr) +
+    "varying vec2 v_uv; uniform sampler2D s0; uniform vec2 u_size; uniform float u_lines, u_scale, u_sharp, u_scan;\n"
+    "void main(){ vec2 uv = v_uv;\n"
+    " if (u_sharp > 0.5) { vec2 pix = uv * u_size; vec2 fl = floor(pix); vec2 f = pix - fl; vec2 r = clamp((f - 0.5) * u_scale + 0.5, 0.0, 1.0); uv = (fl + r) / u_size; }\n"
+    " vec3 c = texture2D(s0, uv).rgb;\n"
+    " if (u_scan > 0.5) { float fy = fract(v_uv.y * u_lines); c *= (0.62 + 0.38 * sin(3.14159265 * fy)) * 1.12; }\n"
+    " gl_FragColor = vec4(c, 1.0); }";
+  d->presentProg = link(pvs, pfs.c_str());
+  // Scale2x / EPX into a texture of twice the EFB size (A = up, B = right, C = left, D = down)
+  std::string efs = std::string(hdr) +
+    "varying vec2 v_uv; uniform sampler2D s0; uniform vec2 u_src;\n"
+    "bool eq(vec3 a, vec3 b){ vec3 d = abs(a - b); return max(d.r, max(d.g, d.b)) < 0.06; }\n"
+    "void main(){ vec2 p = floor(v_uv * u_src * 2.0); vec2 t = floor(p * 0.5); vec2 q = p - t * 2.0; vec2 px = 1.0 / u_src; vec2 c = (t + 0.5) * px;\n"
+    " vec3 P = texture2D(s0, c).rgb, A = texture2D(s0, c + vec2(0.0, px.y)).rgb, D = texture2D(s0, c - vec2(0.0, px.y)).rgb,\n"
+    "      C = texture2D(s0, c - vec2(px.x, 0.0)).rgb, B = texture2D(s0, c + vec2(px.x, 0.0)).rgb; vec3 r = P;\n"
+    " if (q.y > 0.5) { if (q.x < 0.5) { if (eq(C, A) && !eq(C, D) && !eq(A, B)) r = A; } else { if (eq(A, B) && !eq(A, C) && !eq(B, D)) r = B; } }\n"
+    " else { if (q.x < 0.5) { if (eq(D, C) && !eq(D, B) && !eq(C, A)) r = C; } else { if (eq(B, D) && !eq(B, A) && !eq(D, C)) r = D; } }\n"
+    " gl_FragColor = vec4(r, 1.0); }";
+  d->epxProg = link(pvs, efs.c_str());
+  glGenTextures(1, &d->epxTex); glBindTexture(GL_TEXTURE_2D, d->epxTex);
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, d->fboW * 2, d->fboH * 2, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+  glGenFramebuffers(1, &d->epxFbo); glBindFramebuffer(GL_FRAMEBUFFER, d->epxFbo);
+  glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, d->epxTex, 0);
+  if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) { fprintf(stderr, "Scale2x framebuffer incomplete; filter disabled\n"); d->highp = false; }
+  glBindFramebuffer(GL_FRAMEBUFFER, d->fbo);
+  if (!d->highp) fprintf(stderr, "note: no highp fragment precision, output filters disabled\n");
   // EFB -> texture copy conversion: u_mode 0 = RGBA, 1 = intensity (I4/I8), 2 = IA, 3 = alpha only, 4 = RGB (alpha forced 1)
   const char* cfs = "precision mediump float; varying vec2 v_uv; uniform sampler2D s0; uniform int u_mode;"
     "void main(){ vec4 c = texture2D(s0, v_uv); float y = dot(c.rgb, vec3(0.299,0.587,0.114));"
@@ -366,7 +397,7 @@ void Renderer::draw(int prim, const GXVertex* vtx, int n) {
   u32 gen = mm.bpRegs[0x00]; int nTexGen = gen & 15, nTev = ((gen >> 10) & 15) + 1;
   int nChan = (gen >> 4) & 7; (void)nChan;
   glBindFramebuffer(GL_FRAMEBUFFER, D->fbo);
-  glViewport(0, 0, EFB_W, EFB_H);
+  glViewport(0, 0, D->fboW, D->fboH);
   // --- transform
   float P[7]; for (int i = 0; i < 7; i++) P[i] = xff(mm, 0x1020 + i); bool ortho = mm.xf[0x1026] & 1;
   float wd = xff(mm, 0x101A), ht = xff(mm, 0x101B), zr = xff(mm, 0x101C), xo = xff(mm, 0x101D) - 342.f, yo = xff(mm, 0x101E) - 342.f, fz = xff(mm, 0x101F);
@@ -454,7 +485,8 @@ void Renderer::draw(int prim, const GXVertex* vtx, int n) {
   glEnable(GL_SCISSOR_TEST);
   { int l = ((sc0 >> 12) & 0xFFF) - 342, t = (sc0 & 0xFFF) - 342, r = ((sc1 >> 12) & 0xFFF) - 342, b = (sc1 & 0xFFF) - 342;
     l = std::max(l, 0); t = std::max(t, 0); r = std::min(r + 1, (int)EFB_W); b = std::min(b + 1, (int)EFB_H);
-    glScissor(l, EFB_H - b, std::max(0, r - l), std::max(0, b - t)); }
+    float S = D->sc; int x0 = (int)floorf(l * S), y0 = (int)floorf((EFB_H - b) * S), x1 = (int)ceilf(r * S), y1 = (int)ceilf((EFB_H - t) * S);
+    glScissor(x0, y0, std::max(0, x1 - x0), std::max(0, y1 - y0)); }
   if (GENV("NODEPTH")) zm &= ~1u;
   if (zm & 1) { glEnable(GL_DEPTH_TEST); glDepthFunc(GL_NEVER + ((zm >> 1) & 7)); } else glDisable(GL_DEPTH_TEST);
   glDepthMask((zm & 0x10) ? GL_TRUE : GL_FALSE);
@@ -577,16 +609,32 @@ void Renderer::present() {
   glDisable(GL_SCISSOR_TEST); glDisable(GL_DEPTH_TEST); glDisable(GL_BLEND); glDisable(GL_CULL_FACE); glColorMask(1, 1, 1, 1);
   glClearColor(0, 0, 0, 1); glClear(GL_COLOR_BUFFER_BIT);
   { int vw = w, vh = h; if (w * 3 > h * 4) vw = h * 4 / 3; else vh = w * 3 / 4; glViewport((w - vw) / 2, (h - vh) / 2, vw, vh); }
-  glUseProgram(D->presentProg); glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, D->fboTex);
-  glUniform1i(glGetUniformLocation(D->presentProg, "s0"), 0);
+  int fm = D->highp ? filterMode : 0; bool epx = fm >= 3, scan = fm == 1 || fm == 4, sharp = fm >= 2;
   static GLuint qbuf = 0; if (!qbuf) glGenBuffers(1, &qbuf);
   float pos[8] = {-1, -1, 1, -1, -1, 1, 1, 1};
   glBindBuffer(GL_ARRAY_BUFFER, qbuf); glBufferData(GL_ARRAY_BUFFER, sizeof pos, pos, GL_STREAM_DRAW);
   glEnableVertexAttribArray(0); glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, nullptr);
   for (int i = 1; i < 8; i++) glDisableVertexAttribArray(i);
+  GLuint srcTex = D->fboTex; float srcW = D->fboW, srcH = D->fboH;
+  if (epx) {   // pass 1: Scale2x into the 2x texture
+    glBindFramebuffer(GL_FRAMEBUFFER, D->epxFbo); glViewport(0, 0, D->fboW * 2, D->fboH * 2);
+    glUseProgram(D->epxProg); glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, D->fboTex);
+    glUniform1i(glGetUniformLocation(D->epxProg, "s0"), 0); glUniform2f(glGetUniformLocation(D->epxProg, "u_src"), (float)D->fboW, (float)D->fboH);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0); srcTex = D->epxTex; srcW *= 2; srcH *= 2;
+    int vw = w, vh = h; if (w * 3 > h * 4) vw = h * 4 / 3; else vh = w * 3 / 4; glViewport((w - vw) / 2, (h - vh) / 2, vw, vh);
+  }
+  int vh2 = (w * 3 > h * 4) ? h : w * 3 / 4;
+  glUseProgram(D->presentProg); glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, srcTex);
+  glUniform1i(glGetUniformLocation(D->presentProg, "s0"), 0);
+  glUniform2f(glGetUniformLocation(D->presentProg, "u_size"), srcW, srcH);
+  glUniform1f(glGetUniformLocation(D->presentProg, "u_lines"), (float)D->fboH);
+  glUniform1f(glGetUniformLocation(D->presentProg, "u_scale"), std::max(1.0f, vh2 / srcH));
+  glUniform1f(glGetUniformLocation(D->presentProg, "u_sharp"), sharp ? 1.0f : 0.0f);
+  glUniform1f(glGetUniformLocation(D->presentProg, "u_scan"), scan ? 1.0f : 0.0f);
   glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
   if (g_touchUi) drawTouchOverlay(w, h);
-  if (const char* ws = getenv("WINSHOT")) { if (frame == 600) { std::vector<u8> px((size_t)w * h * 4); glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+  if (const char* ws = getenv("WINSHOT")) { if (frame == (getenv("WINFRAME") ? strtoull(getenv("WINFRAME"), 0, 10) : 600)) { std::vector<u8> px((size_t)w * h * 4); glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
     FILE* f = fopen(ws, "wb"); if (f) { fprintf(f, "P6\n%d %d\n255\n", w, h); for (int y = h - 1; y >= 0; y--) for (int x = 0; x < w; x++) fwrite(&px[((size_t)y * w + x) * 4], 1, 3, f); fclose(f); } } }
   SDL_GL_SwapWindow(D->win);
   glBindFramebuffer(GL_FRAMEBUFFER, D->fbo);
@@ -594,11 +642,12 @@ void Renderer::present() {
 }
 
 bool Renderer::saveShot(const char* path) {
-  std::vector<u8> px((size_t)EFB_W * EFB_H * 4);
-  glReadPixels(0, 0, EFB_W, EFB_H, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+  int W = d->fboW, H = d->fboH;
+  std::vector<u8> px((size_t)W * H * 4);
+  glReadPixels(0, 0, W, H, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
   FILE* f = fopen(path, "wb"); if (!f) return false;
-  fprintf(f, "P6\n%d %d\n255\n", EFB_W, EFB_H);
-  for (int y = EFB_H - 1; y >= 0; y--) for (int x = 0; x < EFB_W; x++) fwrite(&px[((size_t)y * EFB_W + x) * 4], 1, 3, f);
+  fprintf(f, "P6\n%d %d\n255\n", W, H);
+  for (int y = H - 1; y >= 0; y--) for (int x = 0; x < W; x++) fwrite(&px[((size_t)y * W + x) * 4], 1, 3, f);
   fclose(f); fprintf(stderr, "screenshot -> %s (frame %llu)\n", path, (unsigned long long)frame); return true;
 }
 
@@ -656,6 +705,7 @@ void Renderer::pollEvents() {
   SDL_Event e;
   while (SDL_PollEvent(&e)) {
     if (e.type == SDL_QUIT) m->cpu.halt("window closed");
+    if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_F2) { filterMode = (filterMode + 1) % kFilters; static const char* nm[] = {"off", "scanlines", "sharp", "scale2x", "scale2x+scanlines"}; fprintf(stderr, "filter: %s\n", nm[filterMode]); }
     if (e.type == SDL_FINGERDOWN || e.type == SDL_FINGERMOTION || e.type == SDL_FINGERUP) {
       g_touchUi = true; int w, h; SDL_GL_GetDrawableSize(d->win, &w, &h);
       auto it = g_fingers.begin(); for (; it != g_fingers.end(); ++it) if (it->id == e.tfinger.fingerId) break;

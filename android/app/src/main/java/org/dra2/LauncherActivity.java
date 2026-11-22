@@ -45,6 +45,16 @@ public class LauncherActivity extends Activity {
         Button fsb = new Button(this); fsb.setText("Frameskip: " + fsNames[fsIdx] + " (tap to change)");
         fsb.setOnClickListener(v -> { prefs.edit().putInt("fs", (fsIdx + 1) % 4).apply(); build(); });
         l.addView(fsb);
+        final String[] flNames = {"Off", "Scanlines", "Sharp pixels", "Scale2x", "Scale2x + scanlines"};
+        final int flIdx = Math.max(0, Math.min(4, prefs.getInt("filter", 0)));
+        Button flb = new Button(this); flb.setText("Filter: " + flNames[flIdx] + " (tap to change)");
+        flb.setOnClickListener(v -> { prefs.edit().putInt("filter", (flIdx + 1) % 5).apply(); build(); });
+        l.addView(flb);
+        final String[] rsNames = {"100%", "75%", "50%"};
+        final int rsIdx = Math.max(0, Math.min(2, prefs.getInt("res", 0)));
+        Button rsb = new Button(this); rsb.setText("Internal resolution: " + rsNames[rsIdx] + " (tap to change)");
+        rsb.setOnClickListener(v -> { prefs.edit().putInt("res", (rsIdx + 1) % 3).apply(); build(); });
+        l.addView(rsb);
         final String log = readLog();
         String saved = prefs.getString("disc", null);
         if (saved != null) {
