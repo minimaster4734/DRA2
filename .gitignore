@@ -1,0 +1,12 @@
+*.iso
+*.gcm
+*.rvz
+*.raw
+*.ppm
+build/
+android/app/jni/SDL/
+android/app/build/
+android/.gradle/
+test/jittest
+test/jitrun
+core/dra2core
