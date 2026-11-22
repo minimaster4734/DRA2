@@ -1,5 +1,9 @@
 // Clean-room GameCube runtime core (no Nintendo or game code included).
 #pragma once
+#include <cstdlib>
+// aligned_alloc is only available from Android API 28; posix_memalign works everywhere
+static inline void* dra2_aligned_alloc(size_t al, size_t sz) { void* p = nullptr; return posix_memalign(&p, al, sz) ? nullptr : p; }
+
 #include <cstdint>
 #include <cstdio>
 #include <cstring>

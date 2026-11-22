@@ -26,7 +26,7 @@ bool JitRT::isSpin(u32 pc) const { for (int i = 0; i < cpu->nspins; i++) if (cpu
 
 JitRT::Entry& JitRT::lookup(CPU* c, u32 pc) {
   cpu = c;
-  if (!fast) { fast = (u32*)aligned_alloc(4096, 65536 * 8); for (u32 i = 0; i < 65536; i++) { fast[2 * i] = 1; fast[2 * i + 1] = 0; } c->jitFast = be->mapFast(fast, 65536 * 8); }
+  if (!fast) { fast = (u32*)dra2_aligned_alloc(4096, 65536 * 8); for (u32 i = 0; i < 65536; i++) { fast[2 * i] = 1; fast[2 * i + 1] = 0; } c->jitFast = be->mapFast(fast, 65536 * 8); }
   Entry& e = table[(pc >> 2) & 0xFFFF];
   if (e.pc == pc) return e;
   u32 pa = pc & 0x1FFFFFFF;

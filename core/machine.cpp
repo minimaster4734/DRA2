@@ -5,7 +5,7 @@
 #include <set>
 
 Bus::Bus() {
-  ram = (u8*)aligned_alloc(4096, (RAM_SIZE + 4096 + 4095) & ~4095u); memset(ram, 0, RAM_SIZE + 4096);
+  ram = (u8*)dra2_aligned_alloc(4096, (RAM_SIZE + 4096 + 4095) & ~4095u); memset(ram, 0, RAM_SIZE + 4096);
   aram = (u8*)calloc(1, ARAM_SIZE);
   lc = (u8*)calloc(1, LC_SIZE);
 }
