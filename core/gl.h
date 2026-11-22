@@ -18,6 +18,9 @@ struct Renderer {
   void efbCopy(u32 val);
   void tlutLoad(u32 ramAddr, u32 tmemOff, u32 count);
   u64 frame = 0;
+  // frameskip: skipped frames drop all draws (no vertex decode, no GL work) and do not present. fsMode: 0 off, N>0 skip N of N+1, -1 auto
+  int fsMode = 0; bool skipNow = false; int texCopyHold = 0, autoLevel = 0; double emaMs = 20; u64 skippedFrames = 0;
+  void frameskipNext();
   void present();
   bool saveShot(const char* path);
   void pollEvents();

@@ -1,3 +1,4 @@
+#include <chrono>
 // GX -> OpenGL ES 2.0 renderer (clean-room). Vertex transform/lighting/texgen on the CPU,
 // TEV compiled to GLSL ES 1.00 fragment shaders, GameCube texture decoding, EFB as an FBO.
 #include "gl.h"
@@ -360,6 +361,7 @@ static void lightChannel(Machine& m, int ch, const GXVertex& v, const float* vpo
 static int g_drawsThisFrame = 0;
 void Renderer::draw(int prim, const GXVertex* vtx, int n) {
   Machine& mm = *m; Impl* D = d; g_drawsThisFrame++;
+  if (skipNow) return;
   { static int mx = GENV("MAXDRAW") ? atoi(GENV("MAXDRAW")) : -1; static int mn = GENV("MINDRAW") ? atoi(GENV("MINDRAW")) : -1; if (mx >= 0 && g_drawsThisFrame > mx) return; if (mn >= 0 && g_drawsThisFrame < mn) return; }
   u32 gen = mm.bpRegs[0x00]; int nTexGen = gen & 15, nTev = ((gen >> 10) & 15) + 1;
   int nChan = (gen >> 4) & 7; (void)nChan;
@@ -504,8 +506,11 @@ void Renderer::efbCopy(u32 v) {
   int x = src & 0x3FF, y = (src >> 10) & 0x3FF, w = (sz & 0x3FF) + 1, h = ((sz >> 10) & 0x3FF) + 1;
   bool half = (v >> 9) & 1;
   if (GENV("DRAWLOG") && (long)frame == atol(GENV("DRAWLOG"))) fprintf(stderr, "EFBCOPY after draw %d toXfb=%d clear=%d v=%X src=%X sz=%X dst=%X zbuf=%X\n", g_drawsThisFrame, (int)toXfb, (int)clear, v, src, sz, dst, mm.bpRegs[0x51]);
-  if (toXfb) { present(); }
-  else {
+  if (toXfb) {
+    if (skipNow) { frame++; skippedFrames++; g_drawsThisFrame = 0; frameskipNext(); pollEvents(); }
+    else { present(); frameskipNext(); }
+  } else {
+    texCopyHold = 120;   // the game renders to textures: skipping would leave them stale, so stay off for a while
     int fmt = ((v >> 4) & 7) | (((v >> 3) & 1) << 3);
     int ow = half ? std::max(1, w / 2) : w, oh = half ? std::max(1, h / 2) : h;
     u32 addr = (dst & 0xFFFFFF) << 5;
@@ -543,6 +548,20 @@ void Renderer::efbCopy(u32 v) {
     glDepthMask(GL_TRUE); glClearDepthf((z & 0xFFFFFF) / 16777215.f);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
   }
+}
+
+void Renderer::frameskipNext() {
+  using clk = std::chrono::steady_clock; static clk::time_point last = clk::now();
+  clk::time_point now = clk::now(); double ms = std::chrono::duration<double, std::milli>(now - last).count(); last = now;
+  if (ms > 200) ms = 200; emaMs = emaMs * 0.8 + ms * 0.2;
+  if (texCopyHold > 0) texCopyHold--;
+  if (fsMode == 0 || texCopyHold > 0) { skipNow = false; return; }
+  int level = fsMode;
+  if (fsMode < 0) {   // auto: 50 Hz target (20 ms); step up when clearly behind, step down when there is headroom
+    if (emaMs > 38) autoLevel = 2; else if (emaMs > 24 && autoLevel < 1) autoLevel = 1; else if (emaMs < 17 && autoLevel > 0) autoLevel--;
+    level = autoLevel;
+  }
+  skipNow = level > 0 && (frame % (level + 1)) != 0;
 }
 
 void Renderer::present() {

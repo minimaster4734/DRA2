@@ -47,13 +47,15 @@ int main(int argc, char** argv) {
       fprintf(stderr, "DRA2 start, %d args:", argc); for (int i = 0; i < argc; i++) fprintf(stderr, " %s", argv[i]); fputc(10, stderr); } }
   { const char* ip = SDL_AndroidGetInternalStoragePath(); if (ip && !getenv("DRA2_CARD")) { static std::string cp = std::string(ip) + "/card_a.raw"; setenv("DRA2_CARD", cp.c_str(), 1); } }
 #endif
-  if (argc < 2) { fprintf(stderr, "usage: %s game.iso [max_million_instr] [-t]\n", argv[0]); return 1; }
+  if (argc < 2) { fprintf(stderr, "usage: %s game.iso [max_million_instr] [-t] [-fs off|N|auto]\n", argv[0]); return 1; }
   Machine* m = new Machine();
   m->bus.m = m; m->cpu.m = m; m->cpu.bus = &m->bus;
   for (int i = 3; i < argc; i++) if (!strcmp(argv[i], "-t")) m->trace = true;
   if (!getenv("NOJIT")) { JitBackend* be = g_backendFactory ? g_backendFactory() : makeNativeBackend(); if (be && !getenv("INTERP")) { g_jit = new JitRT(); g_jit->be = be; fprintf(stderr, "JIT enabled\n"); } }
   if (!m->loadIso(argv[1]) || !m->boot()) { fprintf(stderr, "load/boot failed (errno %d: %s)\n", errno, strerror(errno)); return 2; }
   if (!getenv("NOGFX")) { m->rd = new Renderer(); if (!m->rd->init(m, !getenv("HIDDEN"))) { fprintf(stderr, "renderer init failed: %s\n", SDL_GetError()); m->rd = nullptr; } }
+  if (m->rd) { const char* fs = getenv("FRAMESKIP"); for (int i = 2; i + 1 < argc; i++) if (!strcmp(argv[i], "-fs")) fs = argv[i + 1];
+    if (fs) m->rd->fsMode = !strcmp(fs, "auto") ? -1 : atoi(fs); }
   bool rt = !getenv("NORT") && !getenv("HIDDEN") && !getenv("NOGFX"); if (!getenv("NOAUDIO")) audioInit();
   u64 maxI = (argc > 2 && argv[2][0] != 0x2d ? strtoull(argv[2], 0, 10) : 100000000ull) * 1000000ull;
   u64 nextRep = 0;
@@ -65,6 +67,7 @@ int main(int argc, char** argv) {
 #ifdef OPHIST
   { std::vector<std::pair<u64,int>> v; for (int i = 0; i < 64*1024; i++) if (g_oph[i]) v.push_back({g_oph[i], i}); std::sort(v.rbegin(), v.rend()); for (int i = 0; i < 30 && i < (int)v.size(); i++) fprintf(stderr, "OPH op=%d xo=%d n=%llu\n", v[i].second/1024, v[i].second%1024, (unsigned long long)v[i].first); }
 #endif
+  if (m->rd && m->rd->skippedFrames) fprintf(stderr, "frameskip: %llu frames skipped of %llu\n", (unsigned long long)m->rd->skippedFrames, (unsigned long long)m->rd->frame);
   { extern u64 g_skipped; fprintf(stderr, "executed=%llu skipped=%llu\n", (unsigned long long)(m->cpu.icount - g_skipped), (unsigned long long)g_skipped); }
   if (!g_prof.empty()) { std::vector<std::pair<int,u32>> v; for (auto& kv : g_prof) v.push_back({kv.second, kv.first}); std::sort(v.rbegin(), v.rend()); for (int i = 0; i < 25 && i < (int)v.size(); i++) fprintf(stderr, "PROF %08X %d\n", v[i].second << 4, v[i].first); }
   if (const char* wp = getenv("WAVOUT")) { FILE* f = fopen(wp, "wb"); if (f) { u32 n = (u32)m->audioOut.size() * 2, rate = 32000, br = rate * 4; u16 ch = 2, ba = 4, bps = 16, fmt = 1; u32 sz16 = 16, riff = 36 + n;

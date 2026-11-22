@@ -40,6 +40,11 @@ public class LauncherActivity extends Activity {
         Button pick = new Button(this); pick.setText("Choose disc image");
         pick.setOnClickListener(v -> pick());
         l.addView(t); l.addView(pick);
+        final String[] fsNames = {"Auto", "Off", "1 of 2", "2 of 3"}, fsVals = {"auto", "0", "1", "2"};
+        final int fsIdx = Math.max(0, Math.min(3, prefs.getInt("fs", 0)));
+        Button fsb = new Button(this); fsb.setText("Frameskip: " + fsNames[fsIdx] + " (tap to change)");
+        fsb.setOnClickListener(v -> { prefs.edit().putInt("fs", (fsIdx + 1) % 4).apply(); build(); });
+        l.addView(fsb);
         final String log = readLog();
         String saved = prefs.getString("disc", null);
         if (saved != null) {

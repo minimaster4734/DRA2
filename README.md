@@ -52,6 +52,11 @@ The JIT is used automatically on ARMv7; if executable memory cannot be mapped th
 Status: the native core cross-compiles for ARMv7 and the JIT is verified under emulation; the APK itself has not been
 built or run on a device yet (no Android SDK/NDK was available in the development sandbox).
 
+## Frameskip
+`-fs off|N|auto` (or `FRAMESKIP=`): skipped frames drop all draw calls and do not present, which saves GPU and vertex-decoding work
+while CPU emulation is unaffected. It stays off for 2 seconds whenever the game copies the EFB to a texture (skipping would leave
+those textures stale). The Android launcher has a Frameskip button (default Auto: engages when frames take longer than 24 ms).
+
 ## Saves (memory card)
 Slot A is emulated as a 16 Mbit (251-block) card backed by a raw image: `dra2_card_a.raw` in the working directory on
 Linux (override with `DRA2_CARD=/path`, disable with `NOCARD=1`), `card_a.raw` in the app's private storage on Android.
