@@ -1,3 +1,5 @@
+#include <cctype>
+#include <strings.h>
 #include <csignal>
 #include <cerrno>
 #include <cstring>
@@ -6,6 +8,7 @@
 #include <algorithm>
 #include "gc.h"
 #include "gl.h"
+#include "wii.h"
 #include <cstdlib>
 
 #include <map>
@@ -52,8 +55,26 @@ int main(int argc, char** argv) {
   m->bus.m = m; m->cpu.m = m; m->cpu.bus = &m->bus;
   for (int i = 3; i < argc; i++) if (!strcmp(argv[i], "-t")) m->trace = true;
   if (!getenv("NOJIT")) { JitBackend* be = g_backendFactory ? g_backendFactory() : makeNativeBackend(); if (be && !getenv("INTERP")) { g_jit = new JitRT(); g_jit->be = be; fprintf(stderr, "JIT enabled\n"); } }
+  bool isWad = strlen(argv[1]) > 4 && !strcasecmp(argv[1] + strlen(argv[1]) - 4, ".wad");
+  if (!isWad) { FILE* hf = fopen(argv[1], "rb"); if (hf) { u8 hd[8] = {}; size_t hn = fread(hd, 1, 8, hf); fclose(hf); isWad = hn == 8 && !memcmp(hd, "\0\0\0\x20", 4) && (hd[4] == 'I' || hd[4] == 'i') && (hd[5] == 's' || hd[5] == 'b'); } }   // content sniff: /proc/self/fd/N has no extension
+  if (isWad) {
+    u8 key[16] = {}; const char* kp = getenv("WIIKEYFILE"); for (int i = 2; i + 1 < argc; i++) if (!strcmp(argv[i], "-key")) kp = argv[i + 1];
+    bool haveKey = false;
+    if (const char* hx = getenv("WIIKEY")) { if (strlen(hx) >= 32) { for (int i = 0; i < 16; i++) { char t[3] = {hx[2*i], hx[2*i+1], 0}; key[i] = (u8)strtoul(t, 0, 16); } haveKey = true; } }
+    else if (kp) { FILE* kf = fopen(kp, "rb"); if (kf) { u8 buf[256]; size_t n = fread(buf, 1, sizeof buf, kf); fclose(kf);
+        if (n >= 32 && isxdigit(buf[0])) { bool ok = true; for (int i = 0; i < 16; i++) { char t[3] = {(char)buf[2*i], (char)buf[2*i+1], 0}; if (!isxdigit(t[0]) || !isxdigit(t[1])) ok = false; key[i] = (u8)strtoul(t, 0, 16); } haveKey = ok; }
+        else if (n == 16) { memcpy(key, buf, 16); haveKey = true; } } }
+    if (!haveKey) { fprintf(stderr, "no common key: give a 16-byte key file (raw or 32 hex digits) with -key FILE\n"); return 2; }
+    Wii* w = new Wii(); const char* nd = getenv("WII_NAND");
+#ifdef __ANDROID__
+    { const char* ip = SDL_AndroidGetInternalStoragePath(); if (ip && !nd) { static std::string np = std::string(ip) + "/nand"; setenv("WII_NAND", np.c_str(), 1); } }
+#endif
+    (void)nd;
+    if (!w->open(argv[1], key) || !w->boot(m)) { fprintf(stderr, "WAD load failed: %s\n", w->err.c_str()); return 2; }
+  } else
   if (!m->loadIso(argv[1]) || !m->boot()) { fprintf(stderr, "load/boot failed (errno %d: %s)\n", errno, strerror(errno)); return 2; }
   if (!getenv("NOGFX")) { m->rd = new Renderer(); { const char* sc = getenv("RENDERSCALE"); for (int i = 2; i + 1 < argc; i++) if (!strcmp(argv[i], "-scale")) sc = argv[i + 1]; if (sc) m->rd->renderScale = (float)atof(sc); } if (!m->rd->init(m, !getenv("HIDDEN"))) { fprintf(stderr, "renderer init failed: %s\n", SDL_GetError()); m->rd = nullptr; } }
+  if (m->rd) { for (int i = 2; i < argc; i++) if (!strcmp(argv[i], "-fps")) m->rd->showFps = true; }
   if (m->rd) { const char* fs = getenv("FRAMESKIP"); for (int i = 2; i + 1 < argc; i++) if (!strcmp(argv[i], "-fs")) fs = argv[i + 1];
     if (fs) m->rd->fsMode = !strcmp(fs, "auto") ? -1 : atoi(fs);
     const char* fl = getenv("FILTER"); for (int i = 2; i + 1 < argc; i++) if (!strcmp(argv[i], "-filter")) fl = argv[i + 1];

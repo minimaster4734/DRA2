@@ -1,6 +1,7 @@
 #include "jit_rt.h"
 // Register-level hardware: PI, VI, DI (DVD), DSP handshake, EXI/SI/AI/CP/PE stubs.
 #include "gc.h"
+#include "gl.h"
 #include <set>
 #include <cstdlib>
 
@@ -15,6 +16,7 @@ static void seen(Machine* m, const char* dev, u32 off, bool wr, u32 v, int sz) {
   }
 }
 
+bool wiiIrq(Machine* m);
 void Machine::updateInts() {
   u32 c = 0;
   // DI: status bits 2,4,6 with masks 1,3,5
@@ -30,6 +32,7 @@ void Machine::updateInts() {
     u32 s = exiReg[ch][0];
     if (((s & 2) && (s & 1)) || ((s & 8) && (s & 4)) || ((s & 0x800) && (s & 0x400))) c |= INT_EXI;
   }
+  if (wii && wiiIrq(this)) c |= 1u << 14;
   piIntCause = c;
 }
 
@@ -150,7 +153,9 @@ void Machine::exiWrite(u32 off, u32 val) {
   updateInts();
 }
 
+void wiiTick(Machine* m);
 void Machine::tick() {
+  if (wii) wiiTick(this);
   gxProcess();
   if (cardIntDue && cpu.icount >= cardIntDue) { cardIntDue = 0; exiReg[0][0] |= 2; updateInts(); }
   if (g_card.dirty && cpu.icount - g_card.lastFlush > 600000000ull) { g_card.lastFlush = cpu.icount; g_card.flush(); }
@@ -159,7 +164,7 @@ void Machine::tick() {
       if (!aiDmaDue) aiDmaDue = cpu.icount + (u64)units * 75000;
       else if (cpu.icount >= aiDmaDue) {
         u32 addr = (((u32)dspReg[0x30 >> 1] << 16) | dspReg[0x32 >> 1]) & 0x1FFFFFE0;
-        if (addr + units * 32 <= RAM_SIZE) { const u8* s = bus.ram + addr; size_t o = audioOut.size(); audioOut.resize(o + units * 16);
+        if (inRamPhys(addr, units * 32)) { const u8* s = bus.ram + addr; size_t o = audioOut.size(); audioOut.resize(o + units * 16);
           for (u32 i = 0; i < units * 8; i++) { audioOut[o + i * 2] = (s16)((s[i * 4 + 2] << 8) | s[i * 4 + 3]); audioOut[o + i * 2 + 1] = (s16)((s[i * 4] << 8) | s[i * 4 + 1]); } }   // hardware order is R,L
         aiDmaCount++; dspReg[0x0A >> 1] |= 8; aiDmaDue = 0; updateInts();
       }
@@ -168,7 +173,7 @@ void Machine::tick() {
   if (finishDue && cpu.icount >= finishDue) { finishDue = 0; peReg[0x0A >> 1] |= 8; updateInts(); }
   if (dspRearm && cpu.icount >= dspRearm) { dspRearm = 0; if (!g_romBooted() && !(dspMailToCpu & 0x80000000u)) dspPushMail(0x0071FEED); }
   if (cpu.icount >= nextVi) {
-    nextVi += 6000000; viCount++;
+    nextVi += 6000000; viCount++; if (rd) rd->vblank();
     static std::vector<std::pair<u64, u16>> script; static bool loaded = false;
     if (!loaded) { loaded = true; if (const char* s = GENV("PADSCRIPT")) { std::string str = s; size_t p = 0; while (p < str.size()) { size_t q = str.find(',', p); if (q == std::string::npos) q = str.size();
         std::string it = str.substr(p, q - p); size_t c = it.find(':'); if (c != std::string::npos) script.push_back({strtoull(it.c_str(), 0, 10), (u16)strtoul(it.c_str() + c + 1, 0, 0)}); p = q + 1; } } }

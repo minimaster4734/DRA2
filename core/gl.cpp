@@ -8,8 +8,8 @@
 #include <cstdlib>
 #include <algorithm>
 #include <vector>
-static bool g_touchUi = false;
-static void drawTouchOverlay(int w, int h);
+static bool g_touchUi = false, g_portrait = false, g_showFps = false; static int g_fpsShown = 0;
+static void drawTouchOverlay(int w, int h, bool controls, bool wii);
 
 enum { EFB_W = 640, EFB_H = 528 };
 
@@ -20,7 +20,7 @@ struct TexEntry { GLuint tex = 0; u32 hash = 0; u64 hashFrame = ~0ull; int w = 0
 
 struct Renderer::Impl {
   SDL_Window* win = nullptr; SDL_GLContext ctx = nullptr;
-  GLuint fbo = 0, fboTex = 0, fboDepth = 0, vbo = 0;
+  GLuint fbo = 0, fboTex = 0, fboDepth = 0, vbo = 0, xfbTex = 0, xfbFbo = 0; bool xfbPending = false;
   GLuint presentProg = 0, copyProg = 0, copyFbo = 0;
   GLuint epxProg = 0, epxTex = 0, epxFbo = 0; bool highp = false; int fboW = EFB_W, fboH = EFB_H; float sc = 1.f;
   std::unordered_map<std::string, Prog> progs;
@@ -57,12 +57,18 @@ bool Renderer::init(Machine* mach, bool showWindow) {
   g_touchUi = true;
 #endif
   if (getenv("TOUCH")) g_touchUi = true;
+  g_showFps = showFps || getenv("FPS");
   m = mach; d = new Impl(); d->shown = showWindow;
+  if (const char* ws = getenv("WINSIZE")) { int a = 0, b = 0; if (sscanf(ws, "%dx%d", &a, &b) == 2 && a > 100 && b > 100) { d->winW = a; d->winH = b; } }
   if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER) != 0) { fprintf(stderr, "SDL_Init: %s\n", SDL_GetError()); return false; }
   SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
   SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2); SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
-  d->win = SDL_CreateWindow("DRA2", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, d->winW, d->winH,
-                            SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | (showWindow ? SDL_WINDOW_SHOWN : SDL_WINDOW_HIDDEN));
+  d->win = SDL_CreateWindow("Runtime", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, d->winW, d->winH,
+                            SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | (getenv("FULLSCREEN") ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0)
+#ifdef __ANDROID__
+                            | SDL_WINDOW_FULLSCREEN_DESKTOP | SDL_WINDOW_BORDERLESS   // always fullscreen: no status / navigation bars
+#endif
+                            | (showWindow ? SDL_WINDOW_SHOWN : SDL_WINDOW_HIDDEN));
   if (!d->win) { fprintf(stderr, "window: %s\n", SDL_GetError()); return false; }
   d->ctx = SDL_GL_CreateContext(d->win);
   if (!d->ctx) { fprintf(stderr, "GL context: %s\n", SDL_GetError()); return false; }
@@ -80,6 +86,12 @@ bool Renderer::init(Machine* mach, bool showWindow) {
   glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, d->fboTex, 0);
   glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, d->fboDepth);
   if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) { fprintf(stderr, "EFB framebuffer incomplete\n"); return false; }
+  { glGenTextures(1, &d->xfbTex); glBindTexture(GL_TEXTURE_2D, d->xfbTex);   // latched XFB (Wii: VI shows what was copied before the retrace, not every copy)
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, d->fboW, d->fboH, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glGenFramebuffers(1, &d->xfbFbo); glBindFramebuffer(GL_FRAMEBUFFER, d->xfbFbo); glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, d->xfbTex, 0);
+    glBindFramebuffer(GL_FRAMEBUFFER, d->fbo); }
   glGenBuffers(1, &d->vbo);
   glGenFramebuffers(1, &d->copyFbo);
 
@@ -187,7 +199,7 @@ static void decodeLevel(const u8* src, size_t avail, int fmt, int w, int h, cons
 void Renderer::tlutLoad(u32 ramAddr, u32 tmemOff, u32 count) {
   u32 n = count * 16; u32 base = tmemOff * 16;
   for (u32 i = 0; i < n && base + i < 0x10000; i++) {
-    u32 a = ramAddr + i * 2; if (a + 2 > RAM_SIZE) break;
+    u32 a = ramAddr + i * 2; if (!inRamPhys(a, 2)) break;
     d->tlut[base + i] = (u16)(m->bus.ram[a] << 8 | m->bus.ram[a + 1]);
   }
 }
@@ -212,16 +224,17 @@ static void bindMap(Machine& m, Renderer::Impl* d, u64 frame, int i) {
   int tlutReg = i < 4 ? 0x98 + i : 0xB8 + (i - 4);
   u32 tl = m.bpRegs[tlutReg]; u32 tlOff = tl & 0x3FF; int tf = (tl >> 10) & 3;
   glActiveTexture(GL_TEXTURE0 + i);
+  if (GENV("TEXLOG") && (long)frame == atol(GENV("TEXLOG"))) { u32 nz = 0; if (inRamPhys(addr, 32)) for (int k = 0; k < (int)std::min<size_t>(levelBytes(fmt, w, h), 1 << 16); k++) nz += m.bus.ram[addr + k] != 0; fprintf(stderr, "TEX unit %d addr=%08X fmt=%d %dx%d nonzero=%u efb=%d\n", i, addr, fmt, w, h, nz, (int)(d->efbTex.find(addr) != d->efbTex.end())); }
   TexEntry* e = nullptr;
   auto ef = d->efbTex.find(addr);
   if (ef != d->efbTex.end() && ef->second.w == w && ef->second.h == h) e = &ef->second;
   else {
     u64 key = ((u64)addr << 28) ^ ((u64)fmt << 24) ^ ((u64)w << 12) ^ h ^ ((u64)tlOff << 44) ^ ((u64)tf << 56) ^ (wantMips ? 1ull << 58 : 0);
     TexEntry& t = d->texCache[key]; e = &t;
-    const u8* src = addr < RAM_SIZE ? m.bus.ram + addr : nullptr;
+    const u8* src = inRamPhys(addr, 32) ? m.bus.ram + addr : nullptr;
     if (!src) { if (!t.tex) { glGenTextures(1, &t.tex); } }
     else {
-      size_t avail = RAM_SIZE - addr; size_t span = std::min(avail, levelBytes(fmt, w, h) * (wantMips ? 2 : 1));
+      size_t avail = (addr >= MEM2_BASE ? (size_t)MEM2_BASE + MEM2_SIZE : (size_t)RAM_SIZE) - addr; size_t span = std::min(avail, levelBytes(fmt, w, h) * (wantMips ? 2 : 1));
       u32 hh = quickHash(src, span) ^ (fmt >= 8 && fmt <= 10 ? quickHash((const u8*)&d->tlut[tlOff * 16], 512) : 0);
       if (!t.tex || (t.hashFrame != frame && t.hash != hh)) {
         if (!t.tex) glGenTextures(1, &t.tex);
@@ -528,6 +541,7 @@ void Renderer::draw(int prim, const GXVertex* vtx, int n) {
   glEnableVertexAttribArray(2); glVertexAttribPointer(2, 4, GL_FLOAT, GL_FALSE, stride, (void*)offsetof(OutV, c1));
   for (int t = 0; t < 5; t++) { if (t < std::max(1, ntc)) { glEnableVertexAttribArray(3 + t); glVertexAttribPointer(3 + t, 3, GL_FLOAT, GL_FALSE, stride, (void*)(offsetof(OutV, t) + t * 12)); } else glDisableVertexAttribArray(3 + t); }
   glDrawArrays(mode, 0, (GLsizei)tri.size());
+  if (dbg) { u8 px[4] = {}; glReadPixels(320, 240, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px); fprintf(stderr, "   after draw: center pixel=%d,%d,%d,%d glerr=%X\n", px[0], px[1], px[2], px[3], glGetError()); }
 }
 
 // ---------------------------------------------------------------- EFB copy / present
@@ -538,7 +552,10 @@ void Renderer::efbCopy(u32 v) {
   int x = src & 0x3FF, y = (src >> 10) & 0x3FF, w = (sz & 0x3FF) + 1, h = ((sz >> 10) & 0x3FF) + 1;
   bool half = (v >> 9) & 1;
   if (GENV("DRAWLOG") && (long)frame == atol(GENV("DRAWLOG"))) fprintf(stderr, "EFBCOPY after draw %d toXfb=%d clear=%d v=%X src=%X sz=%X dst=%X zbuf=%X\n", g_drawsThisFrame, (int)toXfb, (int)clear, v, src, sz, dst, mm.bpRegs[0x51]);
-  if (toXfb) {
+  if (GENV("XFBLOG")) { static int kx = 0; if (kx++ < 12) fprintf(stderr, "EFBCOPY toXfb=%d v=%X src=%X sz=%X dst=%X yscale=%X cpy=%X\n", (int)toXfb, v, src, sz, dst, mm.bpRegs[0x4E], mm.bpRegs[0x52]); }
+  if (toXfb && mm.wii) {   // Wii: latch now, present at the next VI retrace
+    if (!skipNow) { glBindFramebuffer(GL_FRAMEBUFFER, D->fbo); glBindTexture(GL_TEXTURE_2D, D->xfbTex); glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, D->fboW, D->fboH); D->xfbPending = true; }
+  } else if (toXfb) {
     if (skipNow) { frame++; skippedFrames++; g_drawsThisFrame = 0; frameskipNext(); pollEvents(); }
     else { present(); frameskipNext(); }
   } else {
@@ -596,33 +613,40 @@ void Renderer::frameskipNext() {
   skipNow = level > 0 && (frame % (level + 1)) != 0;
 }
 
+void Renderer::vblank() {
+  if (!m->wii) return;
+  if (d->xfbPending) { d->xfbPending = false; present(); frameskipNext(); }
+  else { frameskipNext(); pollEvents(); }
+}
+
 void Renderer::present() {
-  Impl* D = d; frame++;
+  Impl* D = d; frame++; const bool wiiX = m->wii != nullptr;
   if (GENV("DRAWSTAT")) { fprintf(stderr, "frame %llu: %d draws\n", (unsigned long long)frame, g_drawsThisFrame); } g_drawsThisFrame = 0;
   if (const char* shotSpec = GENV("SHOT")) {   // "frame:path,frame:path,..."
     std::string str = shotSpec; size_t p = 0;
     while (p < str.size()) { size_t q = str.find(',', p); if (q == std::string::npos) q = str.size(); std::string it = str.substr(p, q - p); size_t c = it.find(':');
-      if (c != std::string::npos && strtoull(it.c_str(), 0, 10) == frame) { glBindFramebuffer(GL_FRAMEBUFFER, D->fbo); saveShot(it.c_str() + c + 1); } p = q + 1; }
+      if (c != std::string::npos && strtoull(it.c_str(), 0, 10) == frame) { glBindFramebuffer(GL_FRAMEBUFFER, wiiX ? D->xfbFbo : D->fbo); saveShot(it.c_str() + c + 1); } p = q + 1; }
   }
   glBindFramebuffer(GL_FRAMEBUFFER, 0);
   int w, h; SDL_GL_GetDrawableSize(D->win, &w, &h);
   glDisable(GL_SCISSOR_TEST); glDisable(GL_DEPTH_TEST); glDisable(GL_BLEND); glDisable(GL_CULL_FACE); glColorMask(1, 1, 1, 1);
   glClearColor(0, 0, 0, 1); glClear(GL_COLOR_BUFFER_BIT);
-  { int vw = w, vh = h; if (w * 3 > h * 4) vw = h * 4 / 3; else vh = w * 3 / 4; glViewport((w - vw) / 2, (h - vh) / 2, vw, vh); }
+  g_portrait = h > w;
+  { int vw = w, vh = h; if (w * 3 > h * 4) vw = h * 4 / 3; else vh = w * 3 / 4; glViewport((w - vw) / 2, g_portrait ? h - vh : (h - vh) / 2, vw, vh); }
   int fm = D->highp ? filterMode : 0; bool epx = fm >= 3, scan = fm == 1 || fm == 4, sharp = fm >= 2;
   static GLuint qbuf = 0; if (!qbuf) glGenBuffers(1, &qbuf);
   float pos[8] = {-1, -1, 1, -1, -1, 1, 1, 1};
   glBindBuffer(GL_ARRAY_BUFFER, qbuf); glBufferData(GL_ARRAY_BUFFER, sizeof pos, pos, GL_STREAM_DRAW);
   glEnableVertexAttribArray(0); glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, nullptr);
   for (int i = 1; i < 8; i++) glDisableVertexAttribArray(i);
-  GLuint srcTex = D->fboTex; float srcW = D->fboW, srcH = D->fboH;
+  GLuint srcTex = wiiX ? D->xfbTex : D->fboTex; float srcW = D->fboW, srcH = D->fboH;
   if (epx) {   // pass 1: Scale2x into the 2x texture
     glBindFramebuffer(GL_FRAMEBUFFER, D->epxFbo); glViewport(0, 0, D->fboW * 2, D->fboH * 2);
-    glUseProgram(D->epxProg); glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, D->fboTex);
+    glUseProgram(D->epxProg); glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, srcTex);
     glUniform1i(glGetUniformLocation(D->epxProg, "s0"), 0); glUniform2f(glGetUniformLocation(D->epxProg, "u_src"), (float)D->fboW, (float)D->fboH);
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     glBindFramebuffer(GL_FRAMEBUFFER, 0); srcTex = D->epxTex; srcW *= 2; srcH *= 2;
-    int vw = w, vh = h; if (w * 3 > h * 4) vw = h * 4 / 3; else vh = w * 3 / 4; glViewport((w - vw) / 2, (h - vh) / 2, vw, vh);
+    int vw = w, vh = h; if (w * 3 > h * 4) vw = h * 4 / 3; else vh = w * 3 / 4; glViewport((w - vw) / 2, g_portrait ? h - vh : (h - vh) / 2, vw, vh);
   }
   int vh2 = (w * 3 > h * 4) ? h : w * 3 / 4;
   glUseProgram(D->presentProg); glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, srcTex);
@@ -633,7 +657,9 @@ void Renderer::present() {
   glUniform1f(glGetUniformLocation(D->presentProg, "u_sharp"), sharp ? 1.0f : 0.0f);
   glUniform1f(glGetUniformLocation(D->presentProg, "u_scan"), scan ? 1.0f : 0.0f);
   glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-  if (g_touchUi) drawTouchOverlay(w, h);
+  { using clk = std::chrono::steady_clock; static clk::time_point t0 = clk::now(); static int cnt = 0; cnt++; clk::time_point now = clk::now();
+    double el = std::chrono::duration<double>(now - t0).count(); if (el >= 1.0) { g_fpsShown = (int)(cnt / el + 0.5); cnt = 0; t0 = now; } }
+  if (g_touchUi || g_showFps) drawTouchOverlay(w, h, g_touchUi, m->wii != nullptr);
   if (const char* ws = getenv("WINSHOT")) { if (frame == (getenv("WINFRAME") ? strtoull(getenv("WINFRAME"), 0, 10) : 600)) { std::vector<u8> px((size_t)w * h * 4); glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
     FILE* f = fopen(ws, "wb"); if (f) { fprintf(f, "P6\n%d %d\n255\n", w, h); for (int y = h - 1; y >= 0; y--) for (int x = 0; x < w; x++) fwrite(&px[((size_t)y * w + x) * 4], 1, 3, f); fclose(f); } } }
   SDL_GL_SwapWindow(D->win);
@@ -652,59 +678,142 @@ bool Renderer::saveShot(const char* path) {
 }
 
 
-// ---------------- on-screen touch controls (Android, or TOUCH=1 on desktop) ----------------
-// Layout in normalised window coordinates (x right, y down; radius relative to window height).
-struct TBtn { float x, y, r; u16 bit; };
-static const TBtn kBtns[] = {
-  {0.90f, 0.70f, 0.085f, 0x0001}, {0.79f, 0.80f, 0.060f, 0x0002}, {0.93f, 0.46f, 0.060f, 0x0004}, {0.80f, 0.56f, 0.060f, 0x0008},   // A B X Y
-  {0.50f, 0.92f, 0.045f, 0x0010}, {0.08f, 0.10f, 0.055f, 0x4000}, {0.92f, 0.10f, 0.055f, 0x2000}, {0.80f, 0.10f, 0.055f, 0x1000},   // Start L R Z
+static const struct { char c; u8 r[7]; } kFont[] = {
+  {'A', {14,17,17,31,17,17,17}},
+  {'B', {30,17,17,30,17,17,30}},
+  {'C', {15,16,16,16,16,16,15}},
+  {'D', {30,17,17,17,17,17,30}},
+  {'E', {31,16,16,30,16,16,31}},
+  {'F', {31,16,16,30,16,16,16}},
+  {'G', {15,16,16,23,17,17,14}},
+  {'H', {17,17,17,31,17,17,17}},
+  {'I', {31,4,4,4,4,4,31}},
+  {'J', {7,2,2,2,2,18,12}},
+  {'K', {17,18,20,24,20,18,17}},
+  {'L', {16,16,16,16,16,16,31}},
+  {'M', {17,27,21,21,17,17,17}},
+  {'N', {17,25,21,19,17,17,17}},
+  {'O', {14,17,17,17,17,17,14}},
+  {'P', {30,17,17,30,16,16,16}},
+  {'Q', {14,17,17,17,21,18,13}},
+  {'R', {30,17,17,30,20,18,17}},
+  {'S', {15,16,16,14,1,1,30}},
+  {'T', {31,4,4,4,4,4,4}},
+  {'U', {17,17,17,17,17,17,14}},
+  {'V', {17,17,17,17,17,10,4}},
+  {'W', {17,17,17,21,21,27,17}},
+  {'X', {17,17,10,4,10,17,17}},
+  {'Y', {17,17,10,4,4,4,4}},
+  {'Z', {31,1,2,4,8,16,31}},
+  {'0', {14,17,19,21,25,17,14}},
+  {'1', {4,12,4,4,4,4,14}},
+  {'2', {14,17,1,2,4,8,31}},
+  {'3', {30,1,1,14,1,1,30}},
+  {'4', {2,6,10,18,31,2,2}},
+  {'5', {31,16,30,1,1,17,14}},
+  {'6', {14,16,16,30,17,17,14}},
+  {'7', {31,1,2,4,8,8,8}},
+  {'8', {14,17,17,14,17,17,14}},
+  {'9', {14,17,17,15,1,1,14}},
+  {'+', {0,4,4,31,4,4,0}},
+  {'-', {0,0,0,31,0,0,0}},
+  {' ', {0,0,0,0,0,0,0}},
+  {':', {0,4,4,0,4,4,0}},
 };
-static const float kStickX = 0.14f, kStickY = 0.70f, kStickR = 0.13f;
+
+// ---------------- on-screen touch controls (Android, or TOUCH=1 on desktop) ----------------
+// Layout in normalised window coordinates (x right, y down); radii are relative to the shorter window side.
+// Button bits are GameCube pad bits; the Wii runtime translates them to Wii Remote buttons (see wiibt.cpp).
+struct TBtn { float x, y, r; u16 bit; const char* gc; const char* wii; };
+static const TBtn kLand[] = {
+  {0.90f, 0.70f, 0.085f, 0x0001, "A", "2 JUMP"}, {0.79f, 0.80f, 0.065f, 0x0002, "B", "1 SHOT"}, {0.93f, 0.46f, 0.060f, 0x0004, "X", "A"}, {0.80f, 0.56f, 0.060f, 0x0008, "Y", "B"},
+  {0.50f, 0.92f, 0.050f, 0x0010, "START", "+ START"}, {0.08f, 0.10f, 0.055f, 0x4000, "L", "HOME"}, {0.92f, 0.10f, 0.055f, 0x2000, "R", nullptr}, {0.80f, 0.10f, 0.055f, 0x1000, "Z", "- SELECT"},
+};
+static const TBtn kPort[] = {
+  {0.80f, 0.86f, 0.115f, 0x0001, "A", "2 JUMP"}, {0.54f, 0.92f, 0.090f, 0x0002, "B", "1 SHOT"}, {0.90f, 0.66f, 0.080f, 0x0004, "X", "A"}, {0.66f, 0.70f, 0.080f, 0x0008, "Y", "B"},
+  {0.50f, 0.78f, 0.060f, 0x0010, "START", "+ START"}, {0.10f, 0.76f, 0.070f, 0x4000, "L", "HOME"}, {0.90f, 0.78f, 0.000f, 0x2000, "R", nullptr}, {0.34f, 0.78f, 0.060f, 0x1000, "Z", "- SELECT"},
+};
+struct Stk { float x, y, r; };
+static const Stk kStkLand = {0.14f, 0.70f, 0.13f}, kStkPort = {0.24f, 0.88f, 0.20f};
+static inline const TBtn* btns() { return g_portrait ? kPort : kLand; }
+static inline Stk stk() { return g_portrait ? kStkPort : kStkLand; }
+static inline bool inStickZone(float x, float y) { return g_portrait ? (x < 0.45f && y > 0.80f) : (x < 0.40f); }
 
 struct Finger { SDL_FingerID id; float x, y; };
 static std::vector<Finger> g_fingers;
 static u16 g_touchMask = 0;
 static void touchRecompute(Machine* m, int w, int h) {
-  u16 bits = 0; bool stick = false; float aspect = (float)w / (float)h;
+  u16 bits = 0; bool stick = false; float u = (float)std::min(w, h); Stk S = stk();
   for (auto& f : g_fingers) {
-    float dx = (f.x - kStickX) * aspect, dy = f.y - kStickY;   // in units of window height
-    if (f.x < 0.40f) {
-      float lim = kStickR * 1.6f; float len = sqrtf(dx * dx + dy * dy); if (len > lim) { dx *= lim / len; dy *= lim / len; }
-      float nx = dx / kStickR, ny = dy / kStickR; if (nx > 1) nx = 1; if (nx < -1) nx = -1; if (ny > 1) ny = 1; if (ny < -1) ny = -1;
+    float dx = (f.x - S.x) * w / u, dy = (f.y - S.y) * h / u;   // in units of the shorter window side
+    if (inStickZone(f.x, f.y)) {
+      float lim = S.r * 1.6f; float len = sqrtf(dx * dx + dy * dy); if (len > lim) { dx *= lim / len; dy *= lim / len; }
+      float nx = dx / S.r, ny = dy / S.r; if (nx > 1) nx = 1; if (nx < -1) nx = -1; if (ny > 1) ny = 1; if (ny < -1) ny = -1;
       m->padStick[0] = (u8)(128 + nx * 100); m->padStick[1] = (u8)(128 - ny * 100); stick = true;
       if (nx > 0.55f) bits |= 0x0200; if (nx < -0.55f) bits |= 0x0100; if (ny > 0.55f) bits |= 0x0400; if (ny < -0.55f) bits |= 0x0800;
       continue;
     }
-    for (auto& b : kBtns) { float bx = (f.x - b.x) * aspect, by = f.y - b.y; if (bx * bx + by * by < b.r * b.r * 1.7f) bits |= b.bit; }
+    for (int i = 0; i < 8; i++) { const TBtn& b = btns()[i]; if (b.r <= 0) continue; float bx = (f.x - b.x) * w / u, by = (f.y - b.y) * h / u; if (bx * bx + by * by < b.r * b.r * 1.7f) bits |= b.bit; }
   }
   if (!stick && !g_fingers.empty()) { m->padStick[0] = m->padStick[1] = 128; }
-  if (!stick && g_touchMask) { /* released: recentre */ bool any = false; for (auto& f : g_fingers) if (f.x < 0.4f) any = true; if (!any) m->padStick[0] = m->padStick[1] = 128; }
+  if (!stick && g_touchMask) { bool any = false; for (auto& f : g_fingers) if (inStickZone(f.x, f.y)) any = true; if (!any) m->padStick[0] = m->padStick[1] = 128; }
   m->padBtn = (m->padBtn & ~(u16)0x0F1F & ~(u16)0x7F00 & ~(u16)0x1000) | bits; g_touchMask = bits | 1;
 }
 static GLuint g_ovProg = 0;
-static void drawTouchOverlay(int w, int h) {
+static SDL_GameController* g_pad = nullptr;
+// text as rectangles from the 5x7 font; px = size of one font pixel in window pixels
+static void textQuads(std::vector<float>& q, const char* s, float cx, float cy, float px, int w, int h, bool centered) {
+  int n = (int)strlen(s); float tw = n * 6 * px - px, x0 = centered ? cx - tw / 2 : cx, y0 = cy - (centered ? 3.5f * px : 0);
+  for (int i = 0; i < n; i++) {
+    const u8* r = nullptr; for (auto& g : kFont) if (g.c == s[i]) { r = g.r; break; } if (!r) continue;
+    for (int yy = 0; yy < 7; yy++) for (int xx = 0; xx < 5; xx++) if (r[yy] & (1 << (4 - xx))) {
+      float px0 = x0 + (i * 6 + xx) * px, py0 = y0 + yy * px, px1 = px0 + px, py1 = py0 + px;
+      float X0 = px0 / w * 2 - 1, X1 = px1 / w * 2 - 1, Y0 = 1 - py0 / h * 2, Y1 = 1 - py1 / h * 2;
+      float t[12] = {X0, Y0, X1, Y0, X0, Y1, X1, Y0, X1, Y1, X0, Y1}; q.insert(q.end(), t, t + 12);
+    }
+  }
+}
+static void drawTouchOverlay(int w, int h, bool controls, bool wii) {
   if (!g_ovProg) {
     g_ovProg = link("attribute vec2 a_pos; void main(){ gl_Position = vec4(a_pos, 0.0, 1.0); }", "precision mediump float; uniform vec4 u_c; void main(){ gl_FragColor = u_c; }");
   }
   glViewport(0, 0, w, h); glUseProgram(g_ovProg); glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-  GLint uc = glGetUniformLocation(g_ovProg, "u_c"); float aspect = (float)w / h;
-  auto disc = [&](float cx, float cy, float r, float a) {   // filled disc as a triangle fan, coordinates normalised, r relative to height
+  GLint uc = glGetUniformLocation(g_ovProg, "u_c"); float u = (float)std::min(w, h);
+  auto disc = [&](float cx, float cy, float r, float a) {   // filled disc, centre normalised, r relative to the shorter side
     float v[2 * 26]; v[0] = cx * 2 - 1; v[1] = 1 - cy * 2;
-    for (int i = 0; i <= 24; i++) { float t = i * 6.2831853f / 24; v[2 + 2 * i] = v[0] + cosf(t) * r * 2 / aspect; v[3 + 2 * i] = v[1] + sinf(t) * r * 2; }
-    glUniform4f(uc, 1, 1, 1, a); glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, v); glEnableVertexAttribArray(0); glDrawArrays(GL_TRIANGLE_FAN, 0, 26);
+    for (int i = 0; i <= 24; i++) { float t = i * 6.2831853f / 24; v[2 + 2 * i] = v[0] + cosf(t) * r * u * 2 / w; v[3 + 2 * i] = v[1] + sinf(t) * r * u * 2 / h; }
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, v); glEnableVertexAttribArray(0);
+    glUniform4f(uc, 0, 0, 0, std::min(0.45f, a * 2.5f)); glDrawArrays(GL_TRIANGLE_FAN, 0, 26);   // dark backing keeps it visible over white game content
+    glUniform4f(uc, 1, 1, 1, a); glDrawArrays(GL_TRIANGLE_FAN, 0, 26);
   };
   for (int i = 1; i < 8; i++) glDisableVertexAttribArray(i);
   glBindBuffer(GL_ARRAY_BUFFER, 0);
-  disc(kStickX, kStickY, kStickR, 0.12f);
-  for (auto& f : g_fingers) if (f.x < 0.40f) disc(f.x, f.y, 0.04f, 0.3f);
-  for (auto& b : kBtns) disc(b.x, b.y, b.r, (g_touchMask & b.bit) ? 0.45f : 0.16f);
+  std::vector<float> q; auto flushText = [&](float a, float r, float g, float b) { if (q.empty()) return; glUniform4f(uc, r, g, b, a); glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, q.data()); glEnableVertexAttribArray(0); glDrawArrays(GL_TRIANGLES, 0, (GLsizei)(q.size() / 2)); q.clear(); };
+  if (controls) {
+    Stk S = stk(); disc(S.x, S.y, S.r, 0.12f);
+    for (auto& f : g_fingers) if (inStickZone(f.x, f.y)) disc(f.x, f.y, 0.04f, 0.3f);
+    if (wii) { float cx = S.x * w, cy = S.y * h, o = S.r * u * 0.72f; float ps = std::max(1.f, floorf(S.r * u / 18)); textQuads(q, "UP", cx, cy - o, ps, w, h, true); textQuads(q, "DOWN", cx, cy + o, ps, w, h, true);
+      textQuads(q, "L", cx - o, cy, ps, w, h, true); textQuads(q, "R", cx + o, cy, ps, w, h, true); flushText(0.55f, 1, 1, 1); }
+    for (int i = 0; i < 8; i++) { const TBtn& b = btns()[i]; const char* lab = wii ? b.wii : b.gc; if (!lab || b.r <= 0) continue; disc(b.x, b.y, b.r, (g_touchMask & b.bit) ? 0.45f : 0.16f);
+      // label: split "N WORD" into a key line and an action line when both exist
+      std::string L = lab; size_t sp = L.find(' '); float diam = b.r * u * 1.8f;
+      if (sp != std::string::npos) { std::string a = L.substr(0, sp), c = L.substr(sp + 1); float ps = std::max(1.f, floorf(std::min(diam / (6.f * c.size()), b.r * u / 8.f)));
+        textQuads(q, a.c_str(), b.x * w, b.y * h - ps * 5, ps * 1.5f, w, h, true); textQuads(q, c.c_str(), b.x * w, b.y * h + ps * 5, ps, w, h, true); }
+      else { float ps = std::max(1.f, floorf(std::min(diam / (6.f * L.size()), b.r * u / 4.f))); textQuads(q, lab, b.x * w, b.y * h, ps, w, h, true); }
+      flushText(0.85f, 1, 1, 1); }
+  }
+  if (g_showFps) { char t[32]; snprintf(t, sizeof t, "FPS %d", g_fpsShown); float ps = std::max(2.f, floorf(u / 120)); textQuads(q, t, w * 0.5f, 8 + 3.5f * ps, ps, w, h, true);
+    // dark backing for legibility
+    float bw = (6 * strlen(t)) * ps + 12, bh = 7 * ps + 12; float bx = w * 0.5f - bw / 2; float X0 = bx / w * 2 - 1, X1 = (bx + bw) / w * 2 - 1, Y1 = 1 - (4 + bh) / h * 2; float bk[8] = {X0, 1 - 4.f / h * 2, X1, 1 - 4.f / h * 2, X0, Y1, X1, Y1};
+    glUniform4f(uc, 0, 0, 0, 0.55f); glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, bk); glEnableVertexAttribArray(0); glDrawArrays(GL_TRIANGLE_STRIP, 0, 4); flushText(1.f, 0.4f, 1.f, 0.4f); }
   glDisable(GL_BLEND);
 }
-static SDL_GameController* g_pad = nullptr;
+
 void Renderer::pollEvents() {
   SDL_Event e;
   while (SDL_PollEvent(&e)) {
     if (e.type == SDL_QUIT) m->cpu.halt("window closed");
+    if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_F3) g_showFps = !g_showFps;
     if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_F2) { filterMode = (filterMode + 1) % kFilters; static const char* nm[] = {"off", "scanlines", "sharp", "scale2x", "scale2x+scanlines"}; fprintf(stderr, "filter: %s\n", nm[filterMode]); }
     if (e.type == SDL_FINGERDOWN || e.type == SDL_FINGERMOTION || e.type == SDL_FINGERUP) {
       g_touchUi = true; int w, h; SDL_GL_GetDrawableSize(d->win, &w, &h);

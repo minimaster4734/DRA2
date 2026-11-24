@@ -50,6 +50,7 @@ static inline void setOV(CPU& c, bool ov) {
 
 void CPU::exception(u32 vec) {
   { static int k=0; if (icount>2634005000ull && (m->piIntCause & 0x100) && k++<60) m->log("EXC %X pc=%08X cause=%X mask=%X", vec, pc, m->piIntCause, m->piIntMask); }
+  if (vec != 0x500 && vec != 0x900 && vec != 0xC00 && GENV("EXCALL")) { static int k2 = 0; if (k2++ < 30) m->log("EXCALL vec=%X pc=%08X srr1=%08X lr=%08X r3=%08X", vec, pc, srr1, lr, gpr[3]); }
   srr0 = pc; srr1 = (msr & 0x87C0FFFF);
   msr &= ~(MSR_EE | MSR_PR | MSR_FP | MSR_IR | MSR_DR | MSR_RI | MSR_LE);
   pc = ((msr & MSR_IP) ? 0xFFF00000u : 0u) + vec;
@@ -172,6 +173,7 @@ void CPU::step(int n) {
   for (int k = 0; k < n && !halted; k++) {
     pcHist[pcHistPos++ & 63] = pc;
     if (__builtin_expect(!g_pcLogs.empty(), 0) && icount >= g_pcStart) { for (u32 q : g_pcLogs) if (pc == q) { static int kk = 0; if (kk++ < 4000) { auto rw = [&](u32 a) { return (u32)b.ram[a&0x1FFFFFFF]<<24 | b.ram[(a&0x1FFFFFFF)+1]<<16 | b.ram[(a&0x1FFFFFFF)+2]<<8 | b.ram[(a&0x1FFFFFFF)+3]; }; if (GENV("PCBT")) { u32 sp = gpr[1]; char bt[200]; int o = 0; for (int q = 0; q < 8 && sp > 0x80000000u && (sp & 0x1FFFFFFF) < RAM_SIZE; q++) { u32 nsp = rw(sp); u32 ra = rw(nsp + 4); o += snprintf(bt + o, sizeof bt - o, " %08X", ra); sp = nsp; } m->log("PCBT %08X sp=%08X bt:%s", pc, gpr[1], bt); } m->log("PCS %08X lr=%08X r3=%08X r4=%08X r5=%08X r6=%08X r7=%08X r29=%08X r30=%08X glob=%08X flag=%08X idx=%08X used=%08X", pc, lr, gpr[3], gpr[4], gpr[5], gpr[6], gpr[7], gpr[29], gpr[30], rw(gpr[13]-0x74a0), rw(gpr[13]-0x74b0), rw(gpr[13]-0x6748), rw(gpr[13]-0x6774)); } } }
+    if (__builtin_expect(g_pcLog != 0, 0) && pc == g_pcLog) { for (int rr = 3; rr <= 6; rr++) { u32 p = gpr[rr]; if (inRamPhys(p & 0x1FFFFFFF, 4) && (p >> 28) >= 8) { char t[160]; int i = 0; for (; i < 159; i++) { u8 ch = b.r8(p + i); if (!ch) break; t[i] = ch >= 32 && ch < 127 ? ch : '.'; } t[i] = 0; if (i >= 3) m->log("PCSTR r%d=%08X \"%s\"", rr, p, t); } } }
     if (__builtin_expect(g_pcLog != 0, 0) && pc == g_pcLog) { static int kc=0; if (kc++<400) m->log("PCLOG %08X lr=%08X GQR=%08X %08X %08X %08X %08X %08X %08X %08X r7=%08X", pc, lr, sprs[912],sprs[913],sprs[914],sprs[915],sprs[916],sprs[917],sprs[918],sprs[919], gpr[7]); m->log("R13=%08X glob=%08X", gpr[13], gpr[13]-0x74a0); if (pc == 0x802CF278 && gpr[3] == 9 && (gpr[4] & 0xFFFFFF) >= 0x545000 && (gpr[4] & 0xFFFFFF) < 0x640000) { static int hh = 0; if (hh++ < 4) { u32 h = gpr[30] & 0x1FFFFFFF; m->log("HDR r30=%08X base=%08X stride=%d lr=%08X", gpr[30], gpr[4], gpr[5], lr); for (int q = 0; q < 12; q++) m->log("  +%02X: %08X", q*4, (u32)m->bus.ram[h+q*4]<<24 | m->bus.ram[h+q*4+1]<<16 | m->bus.ram[h+q*4+2]<<8 | m->bus.ram[h+q*4+3]); } } if (pc == 0x802CF278) m->log("GXSETARRAY r3=%d base=%08X stride=%d r30=%08X r29=%08X r31=%08X lr=%08X", gpr[3], gpr[4], gpr[5], gpr[30], gpr[29], gpr[31], lr); }
     if ((pc & 0x1FFFFFFF) >= RAM_SIZE) { halt("pc outside RAM"); return; }
     u32 op = bswap32(*(u32*)(b.ram + (pc & 0x1FFFFFFF)));

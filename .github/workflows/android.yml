@@ -21,3 +21,5 @@ jobs:
         run: gradle --no-daemon assembleDebug
       - uses: actions/upload-artifact@v4
         with: { name: dra2-debug-apk, path: android/app/build/outputs/apk/debug/*.apk }
+      - uses: actions/upload-artifact@v4
+        with: { name: megaman-debug-apk, path: android/megaman/build/outputs/apk/debug/*.apk }

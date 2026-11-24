@@ -17,7 +17,7 @@ struct AXState {
 enum { MAIN_L, MAIN_R, MAIN_S, AUXA_L, AUXA_R, AUXA_S, AUXB_L, AUXB_R, AUXB_S };
 
 // ---- big-endian helpers on main RAM ----
-inline u8* ramp(Machine& m, u32 a, u32 len) { a &= 0x1FFFFFFF; return (u64)a + len <= RAM_SIZE ? m.bus.ram + a : nullptr; }
+inline u8* ramp(Machine& m, u32 a, u32 len) { a &= 0x1FFFFFFF; return inRamPhys(a, len) ? m.bus.ram + a : nullptr; }
 inline u16 rd16(const u8* p) { return (u16)(p[0] << 8 | p[1]); }
 inline void wr16(u8* p, u16 v) { p[0] = v >> 8; p[1] = (u8)v; }
 inline s32 rd32s(const u8* p) { return (s32)((u32)p[0] << 24 | p[1] << 16 | p[2] << 8 | p[3]); }

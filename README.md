@@ -72,3 +72,19 @@ Slot A is emulated as a 16 Mbit (251-block) card backed by a raw image: `dra2_ca
 Linux (override with `DRA2_CARD=/path`, disable with `NOCARD=1`), `card_a.raw` in the app's private storage on Android.
 On first start the game itself reports an unformatted card; choose "Format Memory Card" (the autosave then creates the
 save file).
+
+## Wii runtime (Mega Man 9 / Mega Man 10, WiiWare) — "Blue Bomber Runtime"
+The same core also runs WiiWare titles: a WAD loader (decrypt + SHA-1 verify), Wii memory map (MEM2), IOS IPC high-level emulation
+(/dev/es, /dev/fs, /dev/stm, /dev/di) and a virtual Bluetooth Wii Remote on top of the Gekko interpreter/JIT and the GX→GLES2 renderer.
+Nothing proprietary is shipped: you supply your own `.wad` and your own Wii common key.
+
+    dra2core game.wad -key common.key        # key: 16 raw bytes or 32 hex digits; or env WIIKEY=<32 hex>
+    WII_NAND=dir   # where the virtual NAND (saves) lives; default ./wii_nand
+    -fps           # FPS counter (F3 toggles)     -fs/-filter/-scale as for the GameCube games
+
+Input (touch overlay / keyboard / gamepad) is translated to a Wii Remote held sideways: overlay buttons are labelled
+`1 SHOT`, `2 JUMP`, `A`, `B`, `+ START`, `- SELECT`, `HOME` and a D-pad. Set `WIIUPRIGHT=1` for an upright remote mapping.
+
+Android: module `android/megaman` (applicationId `org.megarun.player`): launcher asks for the WAD and the key file, offers
+Landscape / Portrait / Auto-rotate, FPS counter, frameskip, filter and internal resolution. The game is always shown in true fullscreen
+(immersive, under the display cutout). Both modules are built by `gradle assembleDebug`.

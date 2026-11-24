@@ -6,7 +6,7 @@ set(SDL_STATIC OFF CACHE BOOL "" FORCE)
 add_subdirectory(SDL ${CMAKE_BINARY_DIR}/sdl)
 set(CORE ${CMAKE_CURRENT_SOURCE_DIR}/../../../core)
 # SDL's Java glue loads "main" and calls SDL_main()
-add_library(main SHARED ${CORE}/main.cpp ${CORE}/cpu.cpp ${CORE}/machine.cpp ${CORE}/hw.cpp ${CORE}/gx.cpp ${CORE}/gl.cpp ${CORE}/ax.cpp ${CORE}/jit.cpp ${CORE}/jit_rt.cpp)
+add_library(main SHARED ${CORE}/main.cpp ${CORE}/cpu.cpp ${CORE}/machine.cpp ${CORE}/hw.cpp ${CORE}/gx.cpp ${CORE}/gl.cpp ${CORE}/ax.cpp ${CORE}/jit.cpp ${CORE}/jit_rt.cpp ${CORE}/wii.cpp ${CORE}/wiibt.cpp)
 target_compile_options(main PRIVATE -O2 -fno-stack-protector -Wno-unused -Wno-invalid-offsetof)
 # the sources include <SDL2/SDL.h>; the SDL subproject only exposes include/, so add a shim directory
 file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/shim)

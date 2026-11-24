@@ -47,7 +47,7 @@ static int vertexSize(Machine& m, int vat) {
 // ---- vertex attribute decoding ----
 static const u8* arrayPtr(Machine& m, int attr, u32 idx) {
   u32 base = m.cpRegs[0xA0 + attr] & 0x1FFFFFFF, stride = m.cpRegs[0xB0 + attr] & 0xFF;
-  u64 a = (u64)base + (u64)idx * stride; return a + 16 < RAM_SIZE ? m.bus.ram + a : nullptr;
+  u64 a = (u64)base + (u64)idx * stride; return (a < 0xFFFFFFFFull && inRamPhys((u32)a, 16)) ? m.bus.ram + a : nullptr;
 }
 static float rdComp(const u8*& p, int fmt, int shift) {
   float v;
@@ -161,8 +161,8 @@ size_t Machine::gxParse(const u8* d, size_t n, size_t p, int depth) {
         p += need; continue; }
       case 0x40: { need = 9; if (p + need > n) goto done; gxStats.callDL++;
         u32 addr = be32(d + p + 1) & 0x1FFFFFFF, size = be32(d + p + 5);
-        if (GENV("DLLOG") && size > 40 && addr + (u64)size <= RAM_SIZE && (bus.ram[addr]==0x99 || bus.ram[addr+1]==0x99)) { static int ln=0; if (ln++ < 40) log("CALLDL addr=%08X size=%X first=%02X %02X %02X %02X %02X %02X %02X %02X", addr, size, bus.ram[addr],bus.ram[addr+1],bus.ram[addr+2],bus.ram[addr+3],bus.ram[addr+4],bus.ram[addr+5],bus.ram[addr+6],bus.ram[addr+7]); }
-        if (depth < 4 && addr + (u64)size <= RAM_SIZE) gxParse(bus.ram + addr, size, 0, depth + 1);
+        if (GENV("DLLOG") && size > 40 && inRamPhys(addr, size) && (bus.ram[addr]==0x99 || bus.ram[addr+1]==0x99)) { static int ln=0; if (ln++ < 40) log("CALLDL addr=%08X size=%X first=%02X %02X %02X %02X %02X %02X %02X %02X", addr, size, bus.ram[addr],bus.ram[addr+1],bus.ram[addr+2],bus.ram[addr+3],bus.ram[addr+4],bus.ram[addr+5],bus.ram[addr+6],bus.ram[addr+7]); }
+        if (depth < 4 && inRamPhys(addr, size)) gxParse(bus.ram + addr, size, 0, depth + 1);
         p += need; continue; }
       case 0x61: need = 5; if (p + need > n) goto done; { u32 v = be32(d + p + 1); gxBP(v >> 24, v & 0xFFFFFF); } p += need; continue;
       default:

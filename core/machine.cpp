@@ -3,13 +3,15 @@
 #include <cstdarg>
 #include <cstdlib>
 #include <set>
+#include <sys/mman.h>
 
 Bus::Bus() {
-  ram = (u8*)dra2_aligned_alloc(4096, (RAM_SIZE + 4096 + 4095) & ~4095u); memset(ram, 0, RAM_SIZE + 4096);
+  ram = (u8*)mmap(nullptr, RAM_MAP_SIZE + 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);   // MEM1 + sparse MEM2 window, zero-filled lazily
+  if (ram == (u8*)MAP_FAILED) { ram = (u8*)dra2_aligned_alloc(4096, (RAM_SIZE + 4096 + 4095) & ~4095u); memset(ram, 0, RAM_SIZE + 4096); ramMapped = false; }
   aram = (u8*)calloc(1, ARAM_SIZE);
   lc = (u8*)calloc(1, LC_SIZE);
 }
-Bus::~Bus() { free(ram); free(aram); free(lc); }
+Bus::~Bus() { if (ramMapped) munmap(ram, RAM_MAP_SIZE + 4096); else free(ram); free(aram); free(lc); }
 
 bool g_watchOn = false;
 static u32 g_unmapped = 0;
@@ -21,35 +23,42 @@ static u64 unmapped(Bus& b, u32 ea, int sz, bool wr, u64 v = 0) {
 #define PHYS(ea) ((ea) & 0x1FFFFFFFu)
 #define IS_LC(ea) ((ea) >= LC_BASE && (ea) < LC_BASE + LC_SIZE)
 #define IS_HW(p) ((p) >= 0x0C000000u && (p) < 0x0C010000u)
+#define IS_M2(p) (wii && ((p) - MEM2_BASE) < MEM2_SIZE)
+#define IS_HOLLY(p) (wii && (p) >= 0x0D000000u && (p) < 0x0D900000u)
 
 u8 Bus::r8(u32 ea) {
   if (IS_LC(ea)) return lc[ea - LC_BASE];
-  u32 p = PHYS(ea); if (p < RAM_SIZE) return ram[p];
+  u32 p = PHYS(ea); if (p < RAM_SIZE || IS_M2(p)) return ram[p];
+  if (IS_HOLLY(p)) return (u8)hollyRead(p - 0x0D000000u, 1);
   if (IS_HW(p)) return (u8)hwRead(p - 0x0C000000u, 1);
   return (u8)unmapped(*this, ea, 1, false);
 }
 u16 Bus::r16(u32 ea) {
   if (IS_LC(ea)) return bswap16(*(u16*)(lc + (ea - LC_BASE)));
-  u32 p = PHYS(ea); if (p < RAM_SIZE) return bswap16(*(u16*)(ram + p));
+  u32 p = PHYS(ea); if (p < RAM_SIZE || IS_M2(p)) return bswap16(*(u16*)(ram + p));
+  if (IS_HOLLY(p)) return (u16)hollyRead(p - 0x0D000000u, 2);
   if (IS_HW(p)) return (u16)hwRead(p - 0x0C000000u, 2);
   return (u16)unmapped(*this, ea, 2, false);
 }
 u32 Bus::r32(u32 ea) {
   if (IS_LC(ea)) return bswap32(*(u32*)(lc + (ea - LC_BASE)));
-  u32 p = PHYS(ea); if (p < RAM_SIZE) return bswap32(*(u32*)(ram + p));
+  u32 p = PHYS(ea); if (p < RAM_SIZE || IS_M2(p)) return bswap32(*(u32*)(ram + p));
+  if (IS_HOLLY(p)) return hollyRead(p - 0x0D000000u, 4);
   if (IS_HW(p)) return hwRead(p - 0x0C000000u, 4);
   return (u32)unmapped(*this, ea, 4, false);
 }
 u64 Bus::r64(u32 ea) { return ((u64)r32(ea) << 32) | r32(ea + 4); }
 void Bus::w8(u32 ea, u8 v) {
   if (IS_LC(ea)) { lc[ea - LC_BASE] = v; return; }
-  u32 p = PHYS(ea); if (p < RAM_SIZE) { ram[p] = v; return; }
+  u32 p = PHYS(ea); if (p < RAM_SIZE || IS_M2(p)) { ram[p] = v; return; }
+  if (IS_HOLLY(p)) { hollyWrite(p - 0x0D000000u, v, 1); return; }
   if (IS_HW(p)) { hwWrite(p - 0x0C000000u, v, 1); return; }
   unmapped(*this, ea, 1, true, v);
 }
 void Bus::w16(u32 ea, u16 v) {
   if (IS_LC(ea)) { *(u16*)(lc + (ea - LC_BASE)) = bswap16(v); return; }
-  u32 p = PHYS(ea); if (p < RAM_SIZE) { *(u16*)(ram + p) = bswap16(v); return; }
+  u32 p = PHYS(ea); if (p < RAM_SIZE || IS_M2(p)) { *(u16*)(ram + p) = bswap16(v); return; }
+  if (IS_HOLLY(p)) { hollyWrite(p - 0x0D000000u, v, 2); return; }
   if (IS_HW(p)) { hwWrite(p - 0x0C000000u, v, 2); return; }
   unmapped(*this, ea, 2, true, v);
 }
@@ -58,12 +67,13 @@ static bool g_wInit = (g_watchOn = g_watch != 0);
 void Bus::w32(u32 ea, u32 v) {
   if (__builtin_expect(g_watch != 0, 0) && (ea & ~3u) == g_watch) { static int k = 0; if (k++ < 100000) this->m->log("WATCH w32 %08X <- %08X pc=%08X lr=%08X", ea, v, this->m->cpu.pc, this->m->cpu.lr); }
   if (IS_LC(ea)) { *(u32*)(lc + (ea - LC_BASE)) = bswap32(v); return; }
-  u32 p = PHYS(ea); if (p < RAM_SIZE) { *(u32*)(ram + p) = bswap32(v); return; }
+  u32 p = PHYS(ea); if (p < RAM_SIZE || IS_M2(p)) { *(u32*)(ram + p) = bswap32(v); return; }
+  if (IS_HOLLY(p)) { hollyWrite(p - 0x0D000000u, v, 4); return; }
   if (IS_HW(p)) { hwWrite(p - 0x0C000000u, v, 4); return; }
   unmapped(*this, ea, 4, true, v);
 }
 void Bus::w64(u32 ea, u64 v) { w32(ea, (u32)(v >> 32)); w32(ea + 4, (u32)v); }
-u8* Bus::ptr(u32 ea) { u32 p = PHYS(ea); return p < RAM_SIZE ? ram + p : nullptr; }
+u8* Bus::ptr(u32 ea) { u32 p = PHYS(ea); return (p < RAM_SIZE || IS_M2(p)) ? ram + p : nullptr; }
 
 void Machine::log(const char* fmt, ...) {
   va_list ap; va_start(ap, fmt);

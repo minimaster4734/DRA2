@@ -19,12 +19,14 @@ struct Renderer {
   void tlutLoad(u32 ramAddr, u32 tmemOff, u32 count);
   u64 frame = 0;
   // frameskip: skipped frames drop all draws (no vertex decode, no GL work) and do not present. fsMode: 0 off, N>0 skip N of N+1, -1 auto
+  bool showFps = false;   // on-screen frames-per-second counter (-fps, F3)
   float renderScale = 1.0f;   // internal resolution relative to the native 640x528 EFB (0.5 .. 1.0); set before init()
   int fsMode = 0; bool skipNow = false; int texCopyHold = 0, autoLevel = 0; double emaMs = 20; u64 skippedFrames = 0;
   void frameskipNext();
   // output filter: 0 off (bilinear), 1 scanlines, 2 sharp-bilinear, 3 Scale2x (EPX), 4 Scale2x + scanlines. Needs highp float in fragment shaders.
   int filterMode = 0; static const int kFilters = 5;
   void present();
+  void vblank();   // called once per VI retrace (Wii: presents the latched XFB)
   bool saveShot(const char* path);
   void pollEvents();
   // internals

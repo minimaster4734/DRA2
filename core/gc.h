@@ -20,17 +20,21 @@ static inline u32 bswap32(u32 v) { return __builtin_bswap32(v); }
 static inline u64 bswap64(u64 v) { return __builtin_bswap64(v); }
 
 enum : u32 {
-  RAM_SIZE = 0x01800000,   // 24 MB main memory
+  RAM_SIZE = 0x01800000,   // 24 MB main memory (MEM1)
+  MEM2_BASE = 0x10000000, MEM2_SIZE = 0x04000000,   // Wii only: 64 MB at physical 0x10000000 (same host buffer, sparse)
+  RAM_MAP_SIZE = MEM2_BASE + MEM2_SIZE,
   ARAM_SIZE = 0x01000000,  // 16 MB aux memory
   LC_BASE = 0xE0000000,    // locked cache
   LC_SIZE = 0x4000,
 };
 
+static inline bool inRamPhys(u32 pa, u64 len) { return ((u64)pa + len <= RAM_SIZE) || (pa >= MEM2_BASE && (u64)pa + len <= (u64)MEM2_BASE + MEM2_SIZE); }
 // ---------------- Memory / bus -----------------
 #define GENV(name) ([]() -> const char* { static const char* v = getenv(name); return v; }())
 extern bool g_watchOn;
 struct Bus {
   u8* ram; u8* aram; u8* lc;
+  bool wii = false; bool ramMapped = true;
   Bus();
   ~Bus();
   // translated accessors (big endian semantics)
@@ -44,7 +48,9 @@ struct Bus {
   inline void fw8(u32 ea, u8 v)   { u32 p = ea & 0x1FFFFFFFu; if (__builtin_expect(ea < FAST_LIM && p < RAM_SIZE, 1)) { ram[p] = v; return; } w8(ea, v); }
   inline void fw16(u32 ea, u16 v) { u32 p = ea & 0x1FFFFFFFu; if (__builtin_expect(ea < FAST_LIM && p < RAM_SIZE, 1)) { v = __builtin_bswap16(v); memcpy(ram + p, &v, 2); return; } w16(ea, v); }
   inline void fw32(u32 ea, u32 v) { u32 p = ea & 0x1FFFFFFFu; if (__builtin_expect(ea < FAST_LIM && p < RAM_SIZE && !g_watchOn, 1)) { v = __builtin_bswap32(v); memcpy(ram + p, &v, 4); return; } w32(ea, v); }
-  u8* ptr(u32 ea);  // direct RAM pointer or nullptr
+  u8* ptr(u32 ea);  // direct RAM pointer or nullptr (MEM1 or, on Wii, MEM2)
+  u32 hollyRead(u32 off, int size);   // Hollywood registers (phys 0x0D000000..)
+  void hollyWrite(u32 off, u32 val, int size);
   // hardware register space (phys 0x0C000000..0x0C00FFFF)
   u32 hwRead(u32 off, int size);
   void hwWrite(u32 off, u32 val, int size);
@@ -137,14 +143,15 @@ struct Machine {
   void axRunList(u32 addr, u32 words);
   void dspPushMail(u32 mail, bool irq = false);
   u64 dspRearm = 0;
-  u64 cardIntDue = 0;   // memory card completion interrupt (EXI0 EXIINT)
-  u64 nextEvent() const { u64 e = nextVi; for (u64 v : {finishDue, axYieldDue, aiDmaDue, dspRearm, cardIntDue}) if (v && v < e) e = v; return e; }
+  u64 cardIntDue = 0; u64 wiiDue = 0;   // memory card completion interrupt (EXI0 EXIINT)
+  u64 nextEvent() const { u64 e = nextVi; for (u64 v : {finishDue, axYieldDue, aiDmaDue, dspRearm, cardIntDue, wiiDue}) if (v && v < e) e = v; return e; }
   u64 finishDue = 0;
   u64 axYieldDue = 0; u64 aiDmaDue = 0; u64 aiDmaCount = 0;
   std::vector<s16> audioOut;   // interleaved stereo samples produced by AI DMA (consumed by the platform layer)
   void gxBP(u32 reg, u32 val);
   // DVD
   u32 diReg[0x40 / 4] = {};
+  struct Wii* wii = nullptr;        // non-null when running a WiiWare title
   void diExec(u32 cmdBit);
   bool readDisc(u64 off, void* dst, u32 len);
 };
