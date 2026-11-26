@@ -29,6 +29,7 @@ struct Wii {
   void tick();
   void handle(u32 addr);
   void reply(u32 addr, s32 result, u64 delay = 4000);
+  void updateDue();
   // device layer
   struct Fd { int kind = 0; std::string path; u32 pos = 0; FILE* f = nullptr; int mode = 0; std::vector<u8> data; int cidx = -1; };
   std::map<int, Fd> fds; int nextFd = 1;

@@ -142,7 +142,7 @@ void CPU::stepJit(int n) {
   while (icount < target && !halted) {
     if (__builtin_expect(nspins && (pc == spins[0].pc || pc == spins[1].pc) && spinHit(), 0) && (msr & MSR_EE) && !decPending && !(m->piIntCause & m->piIntMask)) {
       u64 t = m->nextEvent(); u64 dl = icount + (u64)dec * 8 + 8; if (dl < t) t = dl;
-      if (t > icount + 64) { u64 d8 = (t - icount) / 8; icount += d8 * 8; g_skipped += d8 * 8; tb += d8; dec -= (u32)d8; break; }
+      if (t > icount + 64) { u64 d8 = (t - icount) / 8; icount += d8 * 8; g_skipped += d8 * 8; tb += d8; { u32 od = dec; dec -= (u32)d8; if (d8 > od) decPending = true; } break; }
     }
     if (__builtin_expect((pc & 0x1FFFFFFF) >= RAM_SIZE || pc >= 0xE0000000u, 0)) { halt("pc outside RAM"); return; }
     JitRT::Entry& e = g_jit->lookup(this, pc);
@@ -161,7 +161,7 @@ void CPU::step(int n) {
     if (__builtin_expect((pc & 0x1FFFFFFF) >= RAM_SIZE, 0)) { halt("pc outside RAM"); return; }
     if (__builtin_expect((pc == spins[0].pc || pc == spins[1].pc) && nspins && spinHit(), 0) && (msr & MSR_EE) && !decPending && !(m->piIntCause & m->piIntMask)) {
       u64 t = m->nextEvent(); u64 dl = icount + (u64)dec * 8 + 8; if (dl < t) t = dl;
-      if (t > icount + 64) { u64 d8 = (t - icount) / 8; icount += d8 * 8; g_skipped += d8 * 8; tb += d8; dec -= (u32)d8; break; }
+      if (t > icount + 64) { u64 d8 = (t - icount) / 8; icount += d8 * 8; g_skipped += d8 * 8; tb += d8; { u32 od = dec; dec -= (u32)d8; if (d8 > od) decPending = true; } break; }
     }
     u32 op = bswap32(*(u32*)(b.ram + (pc & 0x1FFFFFFF))); u32 npc = pc + 4; icount++;
 #ifdef OPHIST

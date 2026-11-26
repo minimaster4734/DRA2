@@ -38,7 +38,7 @@ struct Bt {
   void cfgReq(u16 dcid) { sig(0x04, idCtr++, {(u8)dcid, (u8)(dcid >> 8), 0, 0, 1, 2, 0xB9, 0}); }
 
   // ---- HID (device side)
-  bool paired = false; bool l2Started = false; u64 l2Due = 0;
+  bool paired = false; bool l2Started = false; bool statusSent = false; u64 reconnDue = 0; u64 l2Due = 0;
   // GameCube-style input (touch overlay / keyboard / gamepad) -> Wii Remote buttons, remote held sideways (screen-left = remote Up ...)
   u16 buttons() const {
     Machine* m = w->m; u16 p = m->padBtn; if (w->remoteButtons) p |= w->remoteButtons;
@@ -56,11 +56,12 @@ struct Bt {
     if (p & 0x4000) lo |= 0x80;                       // Home
     return (u16)(hi << 8 | lo);
   }
-  void sendInput(const std::vector<u8>& rep) { if (!intrUp) return; std::vector<u8> p = {0xA1}; p.insert(p.end(), rep.begin(), rep.end()); acl(hostIntr, p); }
+  void sendInput(const std::vector<u8>& rep) { if (w->trace && !rep.empty() && rep[0] != 0x30 && rep[0] != 0x31) w->m->log("BT HID in report %02X len=%zu intrUp=%d", rep[0], rep.size(), (int)intrUp); if (!intrUp) return; std::vector<u8> p = {0xA1}; p.insert(p.end(), rep.begin(), rep.end()); acl(hostIntr, p); }
   void sendMode() {
     std::vector<u8> r = {mode, (u8)(buttons() >> 8), (u8)buttons()};
     r[1] = (u8)(buttons() >> 8); r[2] = (u8)buttons();   // BB BB: first byte holds the D-pad/+ bits, second the rest
     r = {mode, (u8)(buttons() >> 8), (u8)(buttons() & 0xFF)};
+    { static int ln = 0; if (buttons() && ln < 12 && w->trace) { ln++; w->m->log("BT input report mode=%02X buttons=%04X sent (intrUp=%d)", mode, buttons(), (int)intrUp); } }
     if (mode == 0x31 || mode == 0x33 || mode == 0x35 || mode == 0x37) { r.push_back(w->remoteAccel[0]); r.push_back(w->remoteAccel[1]); r.push_back(w->remoteAccel[2]); }
     if (mode == 0x32) for (int i = 0; i < 8; i++) r.push_back(0);
     if (mode == 0x33) for (int i = 0; i < 12; i++) r.push_back(0xFF);
@@ -75,14 +76,16 @@ struct Bt {
     if (n < 2) return; u8 id = d[1];
     switch (id) {
       case 0x10: break;
-      case 0x11: leds = d[2] >> 4; ack(id); break;
+      case 0x11: leds = d[2] >> 4; ack(id); if (GENV("EXP_A")) sendStatus(); break;
       case 0x12: continuous = d[2] & 4; mode = d[3]; ack(id); break;
-      case 0x13: case 0x1A: case 0x14: case 0x19: ack(id); break;
+      case 0x13: case 0x1A: case 0x14: case 0x19: ack(id); if (GENV("EXP_B") && id == 0x1A) sendStatus(); break;
       case 0x15: sendStatus(); break;
       case 0x16: ack(id); break;
       case 0x17: {   // read memory / registers
         u8 space = d[2]; u32 addr = d[3] << 16 | d[4] << 8 | d[5]; u32 size = d[6] << 8 | d[7];
         u32 done = 0; if (!size) break;
+        if (addr == 0x1770 && GENV("R17")) { int m17 = atoi(GENV("R17")); if (m17 == 3) break; std::vector<u8> r = {0x21, (u8)(buttons() >> 8), (u8)buttons(), (u8)(((std::min<u32>(size, 16) - 1) << 4) | (m17 == 1 ? 8 : m17 == 2 ? 7 : 0)), (u8)(addr >> 8), (u8)addr}; for (int i = 0; i < 16; i++) r.push_back(m17 == 4 ? 0xFF : 0); sendInput(r); break; }
+        if (!(space & 4) && addr + size > sizeof eeprom) { std::vector<u8> r = {0x21, (u8)(buttons() >> 8), (u8)buttons(), (u8)(((std::min<u32>(size, 16) - 1) << 4) | 8), (u8)(addr >> 8), (u8)addr}; for (int i = 0; i < 16; i++) r.push_back(0); sendInput(r); break; }   // beyond the EEPROM: real remotes answer error 8 (the SDK probes 0x1770)
         while (done < size) { u32 chunk = std::min<u32>(16, size - done); std::vector<u8> r = {0x21, (u8)(buttons() >> 8), (u8)buttons(), (u8)(((chunk - 1) << 4) | ((space & 4) ? 7 : 0)), (u8)((addr + done) >> 8), (u8)(addr + done)};
           for (u32 i = 0; i < 16; i++) r.push_back((space & 4) || i >= chunk ? 0 : (addr + done + i < sizeof eeprom ? eeprom[addr + done + i] : 0)); sendInput(r); done += chunk; }
         break; }
@@ -99,7 +102,7 @@ struct Bt {
         else if (code == 0x04 && len >= 4) { u16 dcid = q[0] | q[1] << 8;   // host's config request -> accept
           sig(0x05, id, {(u8)(dcid == 0x40 ? hostCtrl : hostIntr), (u8)((dcid == 0x40 ? hostCtrl : hostIntr) >> 8), 0, 0, 0, 0});
           if (dcid == 0x40) ctrlCfgIn = true; else intrCfgIn = true; chanCheck(); }
-        else if (code == 0x05 && len >= 6) { u16 scid = q[0] | q[1] << 8; if (scid == hostCtrl) ctrlCfgOut = true; else if (scid == hostIntr) intrCfgOut = true; chanCheck(); }
+        else if (code == 0x05 && len >= 6) { u16 scid = q[0] | q[1] << 8; if (scid == 0x40) ctrlCfgOut = true; else if (scid == 0x41) intrCfgOut = true;   /* scid in a config response is OUR channel id */ chanCheck(); }
         else if (code == 0x02 && len >= 4) { u16 psm = q[0] | q[1] << 8, scid = q[2] | q[3] << 8; (void)psm; sig(0x03, id, {0, 0, (u8)scid, (u8)(scid >> 8), 2, 0, 0, 0}); }   // host-initiated: refuse
         else if (code == 0x08) sig(0x09, id, std::vector<u8>(q, q + len));
         else if (code == 0x0A) sig(0x0B, id, {q[0], q[1], 1, 0});
@@ -110,10 +113,11 @@ struct Bt {
   }
   void chanCheck() {
     if (ctrlCfgIn && ctrlCfgOut && !ctrlUp) { ctrlUp = true; connectReq(0x13, 0x41); }
-    if (intrCfgIn && intrCfgOut && !intrUp) { intrUp = true; connected = true; if (w->trace) w->m->log("BT: Wii Remote channels up"); nextRep = w->m->cpu.icount + 200000; }
+    if (intrCfgIn && intrCfgOut && !intrUp) { intrUp = true; connected = true; w->m->log("BT: Wii Remote channels up"); nextRep = w->m->cpu.icount + 200000; }
   }
   void aclOut(const u8* d, u32 n) {
     if (w->trace) { std::string h; for (u32 i = 0; i < n && i < 40; i++) { char t[4]; snprintf(t, 4, "%02X", d[i]); h += t; } w->m->log("BT ACL out %u bytes: %s", n, h.c_str()); }
+    evt(0x13, {1, (u8)handle, (u8)(handle >> 8), 1, 0});   // Number_Of_Completed_Packets: give the host its ACL buffer credit back (it only has 10)
     if (n < 8) return; u16 len = d[4] | d[5] << 8, cid = d[6] | d[7] << 8; if (len + 8 > n) len = n - 8; l2cap(cid, d + 8, len);
   }
 
@@ -130,9 +134,9 @@ struct Bt {
       case 0x1009: { std::vector<u8> r(hostAddr, hostAddr + 6); cc(op, r); break; }
       case 0x0C25: case 0x0C23: cc(op, {0, 0, 0}); break;
       case 0x0C14: cc(op, std::vector<u8>(248, 0)); break;
-      case 0x0C1A: scanOn = n > 3 && (p[0] & 2); cc(op, {}); if (scanOn && !connReqSent) { connReqSent = true; connDue = w->m->cpu.icount + 3000000; } break;
+      case 0x0C1A: scanOn = n > 3 && (p[0] & 2); w->m->log("BT: scan enable %02X", n > 3 ? p[0] : 0xFF); cc(op, {}); if (scanOn && !connReqSent) { connReqSent = true; connDue = w->m->cpu.icount + 3000000; } break;
       case 0x0409: cs(op); if (n > 9 && p[6] == 0) { std::vector<u8> r = {0}; r.insert(r.end(), wiimote, wiimote + 6); r.push_back(0); evtv(0x12, r); }   // role change: we are master
-        { std::vector<u8> v = {0, (u8)handle, (u8)(handle >> 8)}; v.insert(v.end(), wiimote, wiimote + 6); v.push_back(1); v.push_back(0); evtv(0x03, v); }  if (!paired) { std::vector<u8> lk(wiimote, wiimote + 6); evtv(0x17, lk); }break;   // Accept_Connection_Request -> Connection_Complete
+        { std::vector<u8> v = {0, (u8)handle, (u8)(handle >> 8)}; v.insert(v.end(), wiimote, wiimote + 6); v.push_back(1); v.push_back(0); evtv(0x03, v); }  if (!paired) { std::vector<u8> lk(wiimote, wiimote + 6); evtv(0x17, lk); } else if (!l2Started) { l2Started = true; l2Due = w->m->cpu.icount + 6000000; } break;   // Accept_Connection_Request -> Connection_Complete
       case 0x040A: cs(op); break;
       case 0x0411: { cs(op); std::vector<u8> v(wiimote, wiimote + 6); evtv(0x17, v); break; }       // Authentication_Requested -> Link_Key_Request
       case 0x040B: { cc(op, std::vector<u8>(wiimote, wiimote + 6)); std::vector<u8> v = {0, (u8)handle, (u8)(handle >> 8)}; evtv(0x06, v); paired = true; if (!l2Started) { l2Started = true; l2Due = w->m->cpu.icount + 3000000; } break; }   // Link_Key_Request_Reply -> Authentication_Complete
@@ -151,7 +155,7 @@ struct Bt {
         cc(op, {0xFF, 0, 1, 0}); break; }
       case 0x0C37: cc(op, {(u8)handle, (u8)(handle >> 8)}); break;
       case 0x0401: cs(op); { std::vector<u8> v = {1}; v.insert(v.end(), wiimote, wiimote + 6); v.push_back(1); v.push_back(0); v.push_back(0); v.push_back(0x04); v.push_back(0x25); v.push_back(0); v.push_back(0); v.push_back(0); evtv(0x02, v); } evt(0x01, {0}); break;
-      case 0x0406: if (w->trace) { w->m->log("BT disconnect reason %02X", n > 5 ? p[2] : 0); u32 sp = w->m->cpu.gpr[1]; std::string bt; for (int i = 0; i < 14 && sp; i++) { u32 nxt = w->m->bus.r32(sp), lrv = w->m->bus.r32(nxt + 4); char t[16]; snprintf(t, 16, " %08X", lrv); bt += t; sp = nxt; if (nxt < 0x80000000u) break; } w->m->log("BT disc backtrace pc=%08X lr=%08X:%s", w->m->cpu.pc, w->m->cpu.lr, bt.c_str()); } cs(op); evt(0x05, {0, (u8)handle, (u8)(handle >> 8), 0x16}); connected = ctrlUp = intrUp = false; l2Started = false; ctrlCfgIn = ctrlCfgOut = intrCfgIn = intrCfgOut = false; break;
+      case 0x0406: w->m->log("BT disconnect reason %02X", n > 5 ? p[2] : 0); if (w->trace) { u32 sp = w->m->cpu.gpr[1]; std::string bt; for (int i = 0; i < 14 && sp; i++) { u32 nxt = w->m->bus.r32(sp), lrv = w->m->bus.r32(nxt + 4); char t[16]; snprintf(t, 16, " %08X", lrv); bt += t; sp = nxt; if (nxt < 0x80000000u) break; } w->m->log("BT disc backtrace pc=%08X lr=%08X:%s", w->m->cpu.pc, w->m->cpu.lr, bt.c_str()); } cs(op); evt(0x05, {0, (u8)handle, (u8)(handle >> 8), 0x16}); connected = ctrlUp = intrUp = false; l2Started = false; statusSent = false; connReqSent = false; reconnDue = w->m->cpu.icount + 40000000; ctrlCfgIn = ctrlCfgOut = intrCfgIn = intrCfgOut = false; break;
       case 0x0405: cs(op); break;
       case 0x0C04: cc(op, {}); break;
       case 0x0801: case 0x0802: case 0x080D: cc(op, {(u8)handle, (u8)(handle >> 8)}); break;
@@ -173,8 +177,9 @@ struct Bt {
     u64 now = w->m->cpu.icount;
     if (connReqSent && !connected && connDue && now >= connDue) { connDue = 0;
       std::vector<u8> v(wiimote, wiimote + 6); v.push_back(0x04); v.push_back(0x25); v.push_back(0x00); v.push_back(1); evtv(0x04, v); }   // Connection_Request
+    if (reconnDue && now >= reconnDue && !connected) { if (scanOn && !connReqSent) { reconnDue = 0; connReqSent = true; connDue = now + 1000000; w->m->log("BT: remote reconnecting"); } else if (!scanOn) reconnDue = now + 10000000; }
     if (l2Started && l2Due && now >= l2Due) { l2Due = 0; connectReq(0x11, 0x40); }
-    if (connected && now >= nextRep) { nextRep = now + 3000000; if (continuous || true) sendMode(); }
+    if (connected && now >= nextRep) { nextRep = now + 3000000; if (!statusSent && !GENV("NOSTATUS")) { statusSent = true; sendStatus(); } if (continuous || true) sendMode(); }
     flush();
   }
 };
@@ -201,3 +206,12 @@ s32 btIoctlv(Wii& w, u32 a, bool& defer) {
   return 0;
 }
 void btTick(Wii& w) { if (w.bt) w.bt->tick(); }
+std::string btDebug(Wii& w) { if (!w.bt) return "nobt"; char t[160]; snprintf(t, sizeof t, "evtQ=%zu evtRd=%zu aclQ=%zu aclRd=%zu connected=%d scan=%d", w.bt->evtQ.size(), w.bt->evtRd.size(), w.bt->aclQ.size(), w.bt->aclRd.size(), (int)w.bt->connected, (int)w.bt->scanOn); return t; }
+u64 btNextDue(Wii& w) {
+  if (!w.bt) return 0; Bt& b = *w.bt; u64 d = 0; auto mn = [&](u64 v) { if (v && (!d || v < d)) d = v; };
+  if (b.connReqSent && !b.connected) mn(b.connDue);
+  if (b.reconnDue) mn(b.reconnDue);
+  if (b.l2Started) mn(b.l2Due);
+  if (b.connected) mn(b.nextRep);
+  return d;
+}

@@ -1,3 +1,5 @@
+#include <map>
+#include <algorithm>
 #include "jit_rt.h"
 // Register-level hardware: PI, VI, DI (DVD), DSP handshake, EXI/SI/AI/CP/PE stubs.
 #include "gc.h"
@@ -155,6 +157,9 @@ void Machine::exiWrite(u32 off, u32 val) {
 
 void wiiTick(Machine* m);
 void Machine::tick() {
+  if (GENV("PCPROF")) { static std::map<u32, u32> h; static u64 nxt = 0, n = 0; h[cpu.pc & ~0xFu]++; n++;   // sampled once per slice (every 4096 guest instructions)
+    if (cpu.icount > nxt) { nxt = cpu.icount + 1000000000ull; std::vector<std::pair<u32, u32>> v; for (auto& kv : h) v.push_back({kv.second, kv.first}); std::sort(v.rbegin(), v.rend()); fprintf(stderr, "PCPROF @%lluM:", (unsigned long long)(cpu.icount / 1000000)); for (size_t k = 0; k < v.size() && k < 8; k++) fprintf(stderr, " %08X=%u%%", v[k].second, v[k].first * 100 / (u32)n); fprintf(stderr, "\n"); h.clear(); n = 0; } }
+
   if (wii) wiiTick(this);
   gxProcess();
   if (cardIntDue && cpu.icount >= cardIntDue) { cardIntDue = 0; exiReg[0][0] |= 2; updateInts(); }

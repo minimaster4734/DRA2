@@ -75,6 +75,7 @@ int main(int argc, char** argv) {
   if (!m->loadIso(argv[1]) || !m->boot()) { fprintf(stderr, "load/boot failed (errno %d: %s)\n", errno, strerror(errno)); return 2; }
   if (!getenv("NOGFX")) { m->rd = new Renderer(); { const char* sc = getenv("RENDERSCALE"); for (int i = 2; i + 1 < argc; i++) if (!strcmp(argv[i], "-scale")) sc = argv[i + 1]; if (sc) m->rd->renderScale = (float)atof(sc); } if (!m->rd->init(m, !getenv("HIDDEN"))) { fprintf(stderr, "renderer init failed: %s\n", SDL_GetError()); m->rd = nullptr; } }
   if (m->rd) { for (int i = 2; i < argc; i++) if (!strcmp(argv[i], "-fps")) m->rd->showFps = true; }
+  if (m->rd && m->wii) { u64 t = 1800; if (const char* e = getenv("TURBO")) t = strtoull(e, 0, 10); for (int i = 2; i + 1 < argc; i++) if (!strcmp(argv[i], "-turbo")) t = strtoull(argv[i + 1], 0, 10); m->rd->turboUntil = t; }   // intro fast-forward (VI frames); 0 = off
   if (m->rd) { const char* fs = getenv("FRAMESKIP"); for (int i = 2; i + 1 < argc; i++) if (!strcmp(argv[i], "-fs")) fs = argv[i + 1];
     if (fs) m->rd->fsMode = !strcmp(fs, "auto") ? -1 : atoi(fs);
     const char* fl = getenv("FILTER"); for (int i = 2; i + 1 < argc; i++) if (!strcmp(argv[i], "-filter")) fl = argv[i + 1];
@@ -83,7 +84,14 @@ int main(int argc, char** argv) {
   u64 maxI = (argc > 2 && argv[2][0] != 0x2d ? strtoull(argv[2], 0, 10) : 100000000ull) * 1000000ull;
   u64 nextRep = 0;
   while (!m->cpu.halted && m->cpu.icount < maxI) {
-    m->cpu.step(4096); m->tick(); audioPump(m, getenv("WAVOUT") != nullptr); if (rt && g_adev) audioThrottle();
+    { static auto pt = std::chrono::steady_clock::now(); static u64 pv = 0, pi = 0, pk = 0, pf = 0; static double tcpu = 0, ttick = 0; extern u64 g_skipped;
+      auto t0 = std::chrono::steady_clock::now(); m->cpu.step(4096); auto t1 = std::chrono::steady_clock::now(); m->tick(); auto t2 = std::chrono::steady_clock::now();
+      tcpu += std::chrono::duration<double>(t1 - t0).count(); ttick += std::chrono::duration<double>(t2 - t1).count();
+      double el = std::chrono::duration<double>(t2 - pt).count();
+      if (el >= 2.0) { u64 ic = m->cpu.icount, sk = g_skipped, fr = m->rd ? m->rd->frame : 0;
+        fprintf(stderr, "[perf] guest %.1f fps, shown %.1f fps, executed %.0f MIPS, idle-skipped %d%%, time: cpu %d%% / gx+gl %d%% / other %d%%\n", (m->viCount - pv) / el, (fr - pf) / el, ((ic - pi) - (sk - pk)) / el / 1e6, (int)((sk - pk) * 100 / std::max<u64>(1, ic - pi)), (int)(tcpu * 100 / el), (int)(ttick * 100 / el), (int)(100 - (tcpu + ttick) * 100 / el));
+        pt = t2; pv = m->viCount; pi = ic; pk = sk; pf = fr; tcpu = ttick = 0; } }
+    ; audioPump(m, getenv("WAVOUT") != nullptr); if (rt && g_adev) audioThrottle();
     { static u64 pa = getenv("PROFA") ? strtoull(getenv("PROFA"),0,10)*1000000ull : 0, pb = getenv("PROFB") ? strtoull(getenv("PROFB"),0,10)*1000000ull : 0; if (pa && m->cpu.icount >= pa && m->cpu.icount < pb) { for (int k = 0; k < 4; k++) { /*sample*/ } extern std::map<u32,int> g_prof; g_prof[m->cpu.pc >> 4]++; } }
     if (getenv("STATUS") && m->cpu.icount >= nextRep) { nextRep += 100000000; fprintf(stderr, "[status] %4lluM pc=%08X draws=%llu finish=%llu efbcopy=%llu verts=%llu\n", (unsigned long long)(m->cpu.icount / 1000000), m->cpu.pc, (unsigned long long)m->gxStats.draws, (unsigned long long)m->gxStats.finish, (unsigned long long)m->gxStats.efbCopies, (unsigned long long)m->gxStats.verts); }
   }

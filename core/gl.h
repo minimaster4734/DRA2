@@ -19,6 +19,7 @@ struct Renderer {
   void tlutLoad(u32 ramAddr, u32 tmemOff, u32 count);
   u64 frame = 0;
   // frameskip: skipped frames drop all draws (no vertex decode, no GL work) and do not present. fsMode: 0 off, N>0 skip N of N+1, -1 auto
+  u64 turboUntil = 0;   // Wii: run unthrottled (intro fast-forward) until this VI count or the first user input
   bool showFps = false;   // on-screen frames-per-second counter (-fps, F3)
   float renderScale = 1.0f;   // internal resolution relative to the native 640x528 EFB (0.5 .. 1.0); set before init()
   int fsMode = 0; bool skipNow = false; int texCopyHold = 0, autoLevel = 0; double emaMs = 20; u64 skippedFrames = 0;

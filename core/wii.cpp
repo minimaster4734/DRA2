@@ -6,6 +6,8 @@
 #include <algorithm>
 s32 btIoctlv(Wii& w, u32 a, bool& defer);
 void btTick(Wii& w);
+u64 btNextDue(Wii& w);
+std::string btDebug(Wii& w);
 
 // ------------------------------------------------------------ crypto (AES-128 decrypt, SHA-1)
 namespace {
@@ -194,7 +196,7 @@ void Wii::ipcWrite(u32 off, u32 v) {
   if (off == 4) {
     ppcCtrl = (ppcCtrl & ~0x30u) | (v & 0x30); ppcCtrl &= ~(v & 6);
     if (v & 1) { ppcCtrl |= 2; u32 a = ppcMsg; handle(a); }   // IOS takes the request and acks it
-    m->updateInts(); return;
+    m->updateInts(); updateDue(); return;
   }
   if (off == 0xC) { armCtrl = v; return; }
   if (off >= 0x800000 && off < 0x802000) hw[(off - 0x800000) >> 2] = v;
@@ -203,19 +205,48 @@ void Wii::reply(u32 addr, s32 res, u64 delay) {
   Bus& b = m->bus; u32 cmd = b.r32(addr), fd = b.r32(addr + 8);
   b.w32(addr, 8); b.w32(addr + 4, (u32)res); b.w32(addr + 8, cmd); b.w32(addr + 0xC, fd);
   replies.push_back(addr); if (replies.size() == 1 && !(ppcCtrl & 4)) replyDue = m->cpu.icount + delay;
+  updateDue();
+}
+void Wii::updateDue() {   // tell the idle-loop fast-forward when the next IPC/Bluetooth event is due, so it never skips past it
+  u64 d = replies.empty() ? 0 : (ppcCtrl & 4) ? m->cpu.icount + 20000 : replyDue;
+  u64 bd = btNextDue(*this); if (bd && (!d || bd < d)) d = bd;
+  m->wiiDue = d;
 }
 void Wii::tick() {
+  { // Idle-loop detection: "lwz rX,d(r13); cmpwi rX,0; beq/bne <back to lwz>" is the SDK's wait-for-interrupt spin. Once found, the CPU fast-forwards to the next hardware event
+    // instead of executing millions of identical instructions (the games spend ~90% of their time there).
+    CPU& c = m->cpu; static bool off = getenv("NOIDLE") != nullptr;
+    if (!off && c.nspins < 2 && (c.msr & 0x8000)) {
+      for (int back = 0; back <= 8; back += 4) {
+        u32 a = c.pc - back; u8* p = m->bus.ptr(a); u8* p1 = m->bus.ptr(a + 8); if (!p || !p1) continue;
+        u32 w0 = bswap32(*(u32*)p), w1 = bswap32(*(u32*)(p + 4)), w2 = bswap32(*(u32*)p1);
+        if ((w0 >> 26) != 32 || ((w0 >> 16) & 31) != 13) continue;                        // lwz rD,d(r13)
+        u32 rd = (w0 >> 21) & 31; if (((w1 >> 26) != 11 && (w1 >> 26) != 10) || ((w1 >> 16) & 31) != rd || (w1 & 0xFFFF) != 0) continue;   // cmpwi/cmplwi rD,0
+        if ((w2 >> 26) != 16 || (w2 & 3) != 0 || ((w2 >> 16) & 31) != 2 || (s16)(w2 & 0xFFFC) != -8) continue;                          // b<cond> back to the lwz (cr0.eq)
+        u32 bo = (w2 >> 21) & 31; if (bo != 12 && bo != 4) continue;
+        bool wz = bo == 12;                                                               // beq: loops while the value is zero
+        bool dup = false; for (int k = 0; k < c.nspins; k++) if (c.spins[k].pc == a) dup = true;
+        if (!dup) { c.spins[c.nspins++] = {a, (s32)(s16)(w0 & 0xFFFF), wz}; m->log("idle loop detected at %08X (r13%+d, while %s)", a, (s16)(w0 & 0xFFFF), wz ? "zero" : "non-zero"); }
+        break;
+      }
+    }
+  }
+
+  if (const char* sc = GENV("WIISCRIPT")) {   // test hook: "vi:mask:dur,vi:mask:dur" presses virtual-pad bits for dur VI frames starting at VI count vi
+    u16 b = 0; for (const char* p = sc; *p;) { unsigned long st = strtoul(p, (char**)&p, 10); if (*p == ':') p++; unsigned long mk = strtoul(p, (char**)&p, 0); if (*p == ':') p++; unsigned long du = strtoul(p, (char**)&p, 10); if (*p == ',') p++; if (m->viCount >= st && m->viCount < st + du) b |= (u16)mk; }
+    m->padBtn = b; }
   if (GENV("WIIAUTO")) { u64 ph = (m->cpu.icount / 150000000ull) % 4; m->padBtn = (m->padBtn & ~(u16)0x0005) | (ph == 1 ? 0x0001 : ph == 3 ? 0x0004 : 0); }   // test hook: pulse "2" and "A"
 
   if (GENV("WIISEARCH")) { static bool done = false; if (!done && m->cpu.icount > 200000000ull) { done = true; static const u8 pat[6] = {0x00, 0x19, 0x1D, 0xAA, 0xBB, 0xCC}; static const u8 rev[6] = {0xCC, 0xBB, 0xAA, 0x1D, 0x19, 0x00};
     for (u32 a = 0; a + 6 < RAM_SIZE; a++) { if (!memcmp(m->bus.ram + a, pat, 6)) m->log("SEARCH fwd @%08X", 0x80000000u + a); if (!memcmp(m->bus.ram + a, rev, 6)) m->log("SEARCH rev @%08X", 0x80000000u + a); }
     for (u32 a = 0; a + 6 < MEM2_SIZE; a++) { if (!memcmp(m->bus.ram + MEM2_BASE + a, pat, 6)) m->log("SEARCH fwd @%08X", 0x90000000u + a); } } }
 
+  if (GENV("WIIDBG")) { static u64 nx = 0; if (m->cpu.icount >= nx) { nx = m->cpu.icount + 25000000; m->log("WIIDBG %s replies=%zu ppcCtrl=%X replyDue=%llu wiiDue=%llu nextVi=%llu pc=%08X msr=%X dec=%X decPend=%d pi=%X/%X", btDebug(*this).c_str(), replies.size(), ppcCtrl, (unsigned long long)replyDue, (unsigned long long)m->wiiDue, (unsigned long long)m->nextVi, m->cpu.pc, m->cpu.msr, m->cpu.dec, (int)m->cpu.decPending, m->piIntCause, m->piIntMask); } }
   btTick(*this);
   if (!replies.empty() && !(ppcCtrl & 4) && m->cpu.icount >= replyDue) {
     armMsg = replies.front(); replies.pop_front(); ppcCtrl |= 4; m->updateInts(); replyDue = m->cpu.icount + 3000;
   }
-  m->wiiDue = replies.empty() ? 0 : (ppcCtrl & 4) ? m->cpu.icount + 20000 : replyDue;
+  updateDue();
 }
 void wiiTick(Machine* m) { m->wii->tick(); }
 bool wiiIrq(Machine* m) { return m->wii->irq(); }

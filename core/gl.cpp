@@ -1,4 +1,5 @@
 #include <chrono>
+#include <thread>
 // GX -> OpenGL ES 2.0 renderer (clean-room). Vertex transform/lighting/texgen on the CPU,
 // TEV compiled to GLSL ES 1.00 fragment shaders, GameCube texture decoding, EFB as an FBO.
 #include "gl.h"
@@ -22,6 +23,7 @@ struct Renderer::Impl {
   SDL_Window* win = nullptr; SDL_GLContext ctx = nullptr;
   GLuint fbo = 0, fboTex = 0, fboDepth = 0, vbo = 0, xfbTex = 0, xfbFbo = 0; bool xfbPending = false;
   GLuint presentProg = 0, copyProg = 0, copyFbo = 0;
+  std::vector<float> pend; u64 pendSig = 0; int pendNtc = 1; size_t pendN = 0;   // draw batching: pending triangle vertices sharing one GX state
   GLuint epxProg = 0, epxTex = 0, epxFbo = 0; bool highp = false; int fboW = EFB_W, fboH = EFB_H; float sc = 1.f;
   std::unordered_map<std::string, Prog> progs;
   std::unordered_map<u64, TexEntry> texCache;
@@ -100,8 +102,8 @@ bool Renderer::init(Machine* mach, bool showWindow) {
   const char* hdr = "#ifdef GL_FRAGMENT_PRECISION_HIGH\nprecision highp float;\n#else\nprecision mediump float;\n#endif\n";
   // present pass: bilinear, optional sharp-bilinear (crisp texels, smooth edges) and optional scanlines on the source line grid
   std::string pfs = std::string(hdr) +
-    "varying vec2 v_uv; uniform sampler2D s0; uniform vec2 u_size; uniform float u_lines, u_scale, u_sharp, u_scan;\n"
-    "void main(){ vec2 uv = v_uv;\n"
+    "varying vec2 v_uv; uniform sampler2D s0; uniform vec2 u_size; uniform float u_lines, u_scale, u_sharp, u_scan; uniform vec2 u_crop;\n"
+    "void main(){ vec2 uv = vec2(v_uv.x, u_crop.x + v_uv.y * u_crop.y);\n"
     " if (u_sharp > 0.5) { vec2 pix = uv * u_size; vec2 fl = floor(pix); vec2 f = pix - fl; vec2 r = clamp((f - 0.5) * u_scale + 0.5, 0.0, 1.0); uv = (fl + r) / u_size; }\n"
     " vec3 c = texture2D(s0, uv).rgb;\n"
     " if (u_scan > 0.5) { float fy = fract(v_uv.y * u_lines); c *= (0.62 + 0.38 * sin(3.14159265 * fy)) * 1.12; }\n"
@@ -132,7 +134,7 @@ bool Renderer::init(Machine* mach, bool showWindow) {
     "void main(){ vec4 c = texture2D(s0, v_uv); float y = dot(c.rgb, vec3(0.299,0.587,0.114));"
     " if (u_mode==1) gl_FragColor = vec4(y,y,y,y); else if (u_mode==2) gl_FragColor = vec4(y,y,y,c.a);"
     " else if (u_mode==3) gl_FragColor = vec4(c.a); else if (u_mode==4) gl_FragColor = vec4(c.rgb,1.0); else gl_FragColor = c; }";
-  d->copyProg = link(pvs, cfs);
+  d->copyProg = link("attribute vec2 a_pos; uniform float u_flip; varying vec2 v_uv; void main(){ v_uv = vec2(a_pos.x*0.5+0.5, u_flip > 0.5 ? 0.5-a_pos.y*0.5 : a_pos.y*0.5+0.5); gl_Position = vec4(a_pos,0.0,1.0); }", cfs);   // v flipped: copied texture row 0 = top of the EFB rectangle
   return true;
 }
 
@@ -361,6 +363,20 @@ static std::string buildVertex(int nTexGen) {
 
 // ---------------------------------------------------------------- drawing
 struct OutV { float pos[4]; float c0[4], c1[4]; float t[5][3]; };
+static_assert(sizeof(OutV) == 27 * sizeof(float), "OutV layout");
+static void flushBatch(Renderer::Impl* D) {
+  if (!D->pendN) return;
+  glBindFramebuffer(GL_FRAMEBUFFER, D->fbo);
+  glBindBuffer(GL_ARRAY_BUFFER, D->vbo);
+  glBufferData(GL_ARRAY_BUFFER, D->pendN * sizeof(OutV), D->pend.data(), GL_STREAM_DRAW);
+  const GLsizei stride = sizeof(OutV);
+  glEnableVertexAttribArray(0); glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, stride, (void*)offsetof(OutV, pos));
+  glEnableVertexAttribArray(1); glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, stride, (void*)offsetof(OutV, c0));
+  glEnableVertexAttribArray(2); glVertexAttribPointer(2, 4, GL_FLOAT, GL_FALSE, stride, (void*)offsetof(OutV, c1));
+  for (int t = 0; t < 5; t++) { if (t < std::max(1, D->pendNtc)) { glEnableVertexAttribArray(3 + t); glVertexAttribPointer(3 + t, 3, GL_FLOAT, GL_FALSE, stride, (void*)(offsetof(OutV, t) + t * 12)); } else glDisableVertexAttribArray(3 + t); }
+  glDrawArrays(GL_TRIANGLES, 0, (GLsizei)D->pendN);
+  D->pendN = 0; D->pend.clear();
+}
 
 static void lightChannel(Machine& m, int ch, const GXVertex& v, const float* vpos, const float* vnrm, float* out) {
   u32 colCtl = m.xf[0x100E + ch], alCtl = m.xf[0x1010 + ch];
@@ -471,8 +487,19 @@ void Renderer::draw(int prim, const GXVertex* vtx, int n) {
     case 2: for (int i = 0; i + 2 < n; i += 3) { tri.push_back(ov[i]); tri.push_back(ov[i + 1]); tri.push_back(ov[i + 2]); } break;
     case 3: for (int i = 0; i + 2 < n; i++) { if (i & 1) { tri.push_back(ov[i + 1]); tri.push_back(ov[i]); tri.push_back(ov[i + 2]); } else { tri.push_back(ov[i]); tri.push_back(ov[i + 1]); tri.push_back(ov[i + 2]); } } break;
     case 4: for (int i = 1; i + 1 < n; i++) { tri.push_back(ov[0]); tri.push_back(ov[i]); tri.push_back(ov[i + 1]); } break;
-    case 5: mode = GL_LINES; for (int i = 0; i + 1 < n; i += 2) { tri.push_back(ov[i]); tri.push_back(ov[i + 1]); } break;
-    case 6: mode = GL_LINES; for (int i = 0; i + 1 < n; i++) { tri.push_back(ov[i]); tri.push_back(ov[i + 1]); } break;
+    case 5: case 6: {   // GX lines: 1-pixel-wide quads covering the pixel row/column at/after the coordinate (GL_LINES' diamond rule drops or doubles rows on exact-integer coordinates)
+      static const float lo = getenv("LINEOFF") ? (float)atof(getenv("LINEOFF")) : 0.5f;
+      const float HW = D->fboW * 0.5f, HH = D->fboH * 0.5f;
+      auto seg = [&](const OutV& a, const OutV& b) {
+        float ax = a.pos[0] / a.pos[3] * HW, ay = a.pos[1] / a.pos[3] * HH, bx = b.pos[0] / b.pos[3] * HW, by = b.pos[1] / b.pos[3] * HH;
+        bool horiz = fabsf(bx - ax) >= fabsf(by - ay);
+        OutV q[4] = {a, a, b, b};
+        for (int k = 0; k < 4; k++) { float px = k < 2 ? ax : bx, py = k < 2 ? ay : by, sg = (k & 1) ? 0.5f : -0.5f;
+          if (horiz) py += -lo + sg; else px += lo + sg;
+          q[k].pos[0] = px / HW * q[k].pos[3]; q[k].pos[1] = py / HH * q[k].pos[3]; }
+        tri.push_back(q[0]); tri.push_back(q[1]); tri.push_back(q[2]); tri.push_back(q[1]); tri.push_back(q[3]); tri.push_back(q[2]); };
+      if (prim == 5) { for (int i = 0; i + 1 < n; i += 2) seg(ov[i], ov[i + 1]); } else for (int i = 0; i + 1 < n; i++) seg(ov[i], ov[i + 1]);
+    } break;
     case 7: mode = GL_POINTS; tri = ov; break;
     default: return;
   }
@@ -492,6 +519,18 @@ void Renderer::draw(int prim, const GXVertex* vtx, int n) {
     for (int s = 0; s < nTev; s++) fprintf(stderr, "   tev%d color=%06X alpha=%06X order=%06X\n", s, mm.bpRegs[0xC0 + 2 * s], mm.bpRegs[0xC1 + 2 * s], mm.bpRegs[0x28 + s / 2]);
     for (int i = 0; i < 4; i++) { int sreg = 0x80 + i; fprintf(stderr, "   map%d img0=%06X addr=%06X mode0=%06X\n", i, mm.bpRegs[sreg + 8], mm.bpRegs[sreg + 0x14], mm.bpRegs[sreg]); }
     fprintf(stderr, "   tevreg prev=(%g %g %g %g) k0=(%g %g %g %g) chan0ctl=%X mat0=%08X xf1009=%X\n", mm.tevCol[0][0], mm.tevCol[0][1], mm.tevCol[0][2], mm.tevCol[0][3], mm.tevKonst[0][0], mm.tevKonst[0][1], mm.tevKonst[0][2], mm.tevKonst[0][3], mm.xf[0x100E], mm.xf[0x100C], mm.xf[0x1009]);
+  }
+  // --- batching: draws that share the full GX state (typical for tile-based 2D engines: thousands of identical 8x8 quads) are merged into one GL call
+  static const bool noBatch = GENV("NOBATCH") != nullptr;
+  const bool canBatch = mode == GL_TRIANGLES && !dbg && !noBatch;
+  u64 sig = 0;
+  if (canBatch) {
+    auto mix = [&](const void* p, size_t bytes) { const u32* w = (const u32*)p; for (size_t k = 0; k < bytes / 4; k++) { sig ^= w[k]; sig *= 0x100000001B3ull; sig ^= sig >> 29; } };
+    mix(mm.bpRegs, sizeof(mm.bpRegs)); mix(mm.tevCol, sizeof(mm.tevCol)); mix(mm.tevKonst, sizeof(mm.tevKonst)); sig ^= (u64)D->fboW << 32 | (u32)ntc;
+  }
+  if (D->pendN) {
+    if (canBatch && sig == D->pendSig) { D->pend.insert(D->pend.end(), (const float*)tri.data(), (const float*)tri.data() + tri.size() * 27); D->pendN += tri.size(); return; }
+    flushBatch(D);
   }
   // --- state
   u32 zm = mm.bpRegs[0x40], cm = mm.bpRegs[0x41], sc0 = mm.bpRegs[0x20], sc1 = mm.bpRegs[0x21];
@@ -532,6 +571,7 @@ void Renderer::draw(int prim, const GXVertex* vtx, int n) {
   glUniform4fv(pr->uR, 4, &mm.tevCol[0][0]); glUniform4fv(pr->uK, 4, &mm.tevKonst[0][0]);
   glUniform2f(pr->uAref, (float)(mm.bpRegs[0xF3] & 255), (float)((mm.bpRegs[0xF3] >> 8) & 255));
   for (int i = 0; i < 8; i++) if (usedMaps & (1 << i)) { bindMap(mm, D, frame, i); if (pr->uS[i] >= 0) glUniform1i(pr->uS[i], i); }
+  if (canBatch) { D->pend.assign((const float*)tri.data(), (const float*)tri.data() + tri.size() * 27); D->pendN = tri.size(); D->pendSig = sig; D->pendNtc = ntc; return; }   // issued by flushBatch
   // --- upload + draw
   glBindBuffer(GL_ARRAY_BUFFER, D->vbo);
   glBufferData(GL_ARRAY_BUFFER, tri.size() * sizeof(OutV), tri.data(), GL_STREAM_DRAW);
@@ -546,7 +586,7 @@ void Renderer::draw(int prim, const GXVertex* vtx, int n) {
 
 // ---------------------------------------------------------------- EFB copy / present
 void Renderer::efbCopy(u32 v) {
-  Machine& mm = *m; Impl* D = d;
+  Machine& mm = *m; Impl* D = d; flushBatch(D);
   bool toXfb = (v >> 14) & 1, clear = (v >> 11) & 1;
   u32 src = mm.bpRegs[0x49], sz = mm.bpRegs[0x4A], dst = mm.bpRegs[0x4B];
   int x = src & 0x3FF, y = (src >> 10) & 0x3FF, w = (sz & 0x3FF) + 1, h = ((sz >> 10) & 0x3FF) + 1;
@@ -559,6 +599,8 @@ void Renderer::efbCopy(u32 v) {
     if (skipNow) { frame++; skippedFrames++; g_drawsThisFrame = 0; frameskipNext(); pollEvents(); }
     else { present(); frameskipNext(); }
   } else {
+    if (GENV("DUMPCOPY") && (long)frame == atol(GENV("DUMPCOPY"))) { static int k = 0; int ww = std::min(w, D->fboW), hh = std::min(h, D->fboH); std::vector<u8> px((size_t)ww * hh * 4); glBindFramebuffer(GL_FRAMEBUFFER, D->fbo); glReadPixels(x, D->fboH - y - hh, ww, hh, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+      char nm[64]; snprintf(nm, sizeof nm, "copy%d.ppm", k++); if (FILE* f = fopen(nm, "wb")) { fprintf(f, "P6\n%d %d\n255\n", ww, hh); for (int r = hh - 1; r >= 0; r--) for (int c = 0; c < ww; c++) fwrite(&px[((size_t)r * ww + c) * 4], 1, 3, f); fclose(f); } fprintf(stderr, "dumped %s %dx%d src=%d,%d\n", nm, ww, hh, x, y); }
     texCopyHold = 120;   // the game renders to textures: skipping would leave them stale, so stay off for a while
     int fmt = ((v >> 4) & 7) | (((v >> 3) & 1) << 3);
     int ow = half ? std::max(1, w / 2) : w, oh = half ? std::max(1, h / 2) : h;
@@ -582,7 +624,8 @@ void Renderer::efbCopy(u32 v) {
     float pos[8] = {-1, -1, 1, -1, -1, 1, 1, 1};
     glBindBuffer(GL_ARRAY_BUFFER, qbuf); glBufferData(GL_ARRAY_BUFFER, sizeof pos, pos, GL_STREAM_DRAW);
     // v_uv = a_pos*0.5+0.5 spans [0,1]; to sample a sub-rect we adjust the viewport so the full-EFB texture is mapped and the rect is cropped
-    glViewport(-(int)(x * (ow / (float)w)), -(int)((EFB_H - (y + h)) * (oh / (float)h)) , (int)(EFB_W * (ow / (float)w)), (int)(EFB_H * (oh / (float)h)));
+    glUniform1f(glGetUniformLocation(D->copyProg, "u_flip"), m->wii ? 1.f : 0.f);
+    glViewport(-(int)(x * (ow / (float)w)), m->wii ? -(int)(y * (oh / (float)h)) : -(int)((EFB_H - (y + h)) * (oh / (float)h)) , (int)(EFB_W * (ow / (float)w)), (int)(EFB_H * (oh / (float)h)));
     glEnable(GL_SCISSOR_TEST); glScissor(0, 0, ow, oh);
     glEnableVertexAttribArray(0); glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, nullptr);
     for (int i = 1; i < 8; i++) glDisableVertexAttribArray(i);
@@ -615,12 +658,20 @@ void Renderer::frameskipNext() {
 
 void Renderer::vblank() {
   if (!m->wii) return;
+  if (turboUntil && (m->viCount >= turboUntil || m->padBtn || m->padStick[0] < 64 || m->padStick[0] > 192 || m->padStick[1] < 64 || m->padStick[1] > 192)) { turboUntil = 0; fprintf(stderr, "turbo (intro skip) ended at VI %llu\n", (unsigned long long)m->viCount); }
+  static const bool noRt = getenv("NORT") || getenv("HIDDEN") || getenv("NOGFX");
+  if (!turboUntil && !noRt) {   // 60 Hz real-time limiter (no audio clock on Wii to pace the emulation)
+    using clk = std::chrono::steady_clock; static clk::time_point next = clk::now(); static bool was = false;
+    clk::time_point now = clk::now(); if (!was || now - next > std::chrono::milliseconds(100)) next = now; was = true;
+    next += std::chrono::microseconds(16683);
+    if (next > now) std::this_thread::sleep_until(next);
+  }
   if (d->xfbPending) { d->xfbPending = false; present(); frameskipNext(); }
   else { frameskipNext(); pollEvents(); }
 }
 
 void Renderer::present() {
-  Impl* D = d; frame++; const bool wiiX = m->wii != nullptr;
+  Impl* D = d; flushBatch(D); frame++; const bool wiiX = m->wii != nullptr;
   if (GENV("DRAWSTAT")) { fprintf(stderr, "frame %llu: %d draws\n", (unsigned long long)frame, g_drawsThisFrame); } g_drawsThisFrame = 0;
   if (const char* shotSpec = GENV("SHOT")) {   // "frame:path,frame:path,..."
     std::string str = shotSpec; size_t p = 0;
@@ -653,6 +704,7 @@ void Renderer::present() {
   glUniform1i(glGetUniformLocation(D->presentProg, "s0"), 0);
   glUniform2f(glGetUniformLocation(D->presentProg, "u_size"), srcW, srcH);
   glUniform1f(glGetUniformLocation(D->presentProg, "u_lines"), (float)D->fboH);
+  { float cy = wiiX ? 480.f / EFB_H : 1.f; glUniform2f(glGetUniformLocation(D->presentProg, "u_crop"), 0.f, cy); if (wiiX) glUniform2f(glGetUniformLocation(D->presentProg, "u_crop"), 1.f - cy, cy); }   // Wii games draw 640x480 into the 640x528 EFB: show only those rows (was squashed + black strip)
   glUniform1f(glGetUniformLocation(D->presentProg, "u_scale"), std::max(1.0f, vh2 / srcH));
   glUniform1f(glGetUniformLocation(D->presentProg, "u_sharp"), sharp ? 1.0f : 0.0f);
   glUniform1f(glGetUniformLocation(D->presentProg, "u_scan"), scan ? 1.0f : 0.0f);
@@ -674,7 +726,7 @@ bool Renderer::saveShot(const char* path) {
   FILE* f = fopen(path, "wb"); if (!f) return false;
   fprintf(f, "P6\n%d %d\n255\n", W, H);
   for (int y = H - 1; y >= 0; y--) for (int x = 0; x < W; x++) fwrite(&px[((size_t)y * W + x) * 4], 1, 3, f);
-  fclose(f); fprintf(stderr, "screenshot -> %s (frame %llu)\n", path, (unsigned long long)frame); return true;
+  fclose(f); fprintf(stderr, "screenshot -> %s (frame %llu, vi %llu)\n", path, (unsigned long long)frame, (unsigned long long)m->viCount); return true;
 }
 
 
